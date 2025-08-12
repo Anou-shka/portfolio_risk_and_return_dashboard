@@ -1,0 +1,15 @@
+[theme]
+# Dark theme to match your current design
+primaryColor = "#00D4AA"          # Green accent (like your success message)
+backgroundColor = "#0E1117"        # Dark background
+secondaryBackgroundColor = "#262730"  # Slightly lighter dark for cards/sidebar
+textColor = "#FAFAFA"             # Light text for contrast
+
+[server]
+headless = true
+port = 8501
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false
