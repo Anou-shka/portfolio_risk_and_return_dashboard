@@ -1,0 +1,17 @@
+tickers: [AAPL, MSFT, JNJ, JPM, XOM, AMZN, GOOGL, TSLA, SPY, GLD]
+benchmark: {
+    "^GSPC": "S&P 500 Index (US)",
+    "^STI": "Straits Times Index (Singapore)",
+}
+risk_free_rate: 0.04
+default_weights:
+  AAPL: 0.10
+  MSFT: 0.10
+  JNJ: 0.08
+  JPM: 0.08
+  XOM: 0.08
+  AMZN: 0.12
+  GOOGL: 0.10
+  TSLA: 0.08
+  SPY: 0.16
+  GLD: 0.10
