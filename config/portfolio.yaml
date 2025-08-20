@@ -1,17 +1,36 @@
-tickers: [AAPL, MSFT, JNJ, JPM, XOM, AMZN, GOOGL, TSLA, SPY, GLD]
-benchmark: {
-    "^GSPC": "S&P 500 Index (US)",
-    "^STI": "Straits Times Index (Singapore)",
-}
-risk_free_rate: 0.04
+tickers: ["AAPL", "MSFT", "JNJ", "JPM", "XOM", "AMZN", "GOOGL", "TSLA", "SPY", "GLD"]
+
+benchmarks:
+  "^GSPC": "S&P 500 Index (US)"
+  
+default_benchmark: "^GSPC" 
+
+risk_free_rate_annual: 0.04  # 4% per year
+
 default_weights:
-  AAPL: 0.10
-  MSFT: 0.10
-  JNJ: 0.08
-  JPM: 0.08
-  XOM: 0.08
-  AMZN: 0.12
+  AAPL:  0.10
+  MSFT:  0.10
+  JNJ:   0.08
+  JPM:   0.08
+  XOM:   0.08
+  AMZN:  0.12
   GOOGL: 0.10
-  TSLA: 0.08
-  SPY: 0.16
-  GLD: 0.10
+  TSLA:  0.08
+  SPY:   0.16
+  GLD:   0.10
+
+metadata:
+  AAPL:  { sector: "Information Technology", region: "US" }
+  MSFT:  { sector: "Information Technology", region: "US" }
+  JNJ:   { sector: "Health Care",            region: "US" }
+  JPM:   { sector: "Financials",             region: "US" }
+  XOM:   { sector: "Energy",                 region: "US" }
+  AMZN:  { sector: "Consumer Discretionary", region: "US" }
+  GOOGL: { sector: "Communication Services", region: "US" }
+  TSLA:  { sector: "Consumer Discretionary", region: "US" }
+  SPY:   { sector: "ETF (US Broad Market)",  region: "US" }
+  GLD:   { sector: "Commodity (Gold)",       region: "Global" }
+
+refresh_interval:
+  market_open: 60      # refresh every 60s when market is open
+  market_closed: 900   # refresh every 15 min when market is closed

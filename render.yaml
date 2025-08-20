@@ -1,0 +1,107 @@
+services:
+  - type: web
+    name: portfolio-live
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app/app.py --server.port $PORT --server.address 0.0.0.0
+
+  - type: web
+    name: portfolio-live
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app/app_dashboard.py --server.port $PORT --server.address 0.0.0.0
+
+  - type: web
+    name: portfolio-live
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app/app_streamlit.py --server.port $PORT --server.address 0.0.0.0
+
+  - type: web
+    name: portfolio-live
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app/app_streamlit.py --server.port $PORT --server.address 0.0.0.0
+
+
+jobs:
+  # Every minute on weekdays → writes intraday ticks if market is open
+  - name: live-ticks
+    env: python
+    schedule: "*/1 * * * 1-5"    # UTC; runs 24h but job_tick gates on market hours
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.cron_jobs tick
+
+  # Finalize after close; run a few times to cover posting delays & DST changes
+  - name: eod-finalize-2010
+    env: python
+    schedule: "10 20 * * 1-5"    # 20:10 UTC (covers EDT close)
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.cron_jobs finalize
+
+  - name: eod-finalize-2110
+    env: python
+    schedule: "10 21 * * 1-5"    # 21:10 UTC (covers EST close)
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.cron_jobs finalize
+
+  # Daily EOD append: runs after NY close; safe to run twice (DST covered)
+  - name: data-fetch-update-2015
+    env: python
+    schedule: "15 20 * * 1-5"     # 20:15 UTC (covers EDT close)
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.data_fetch update
+
+  - name: data-fetch-update-2115
+    env: python
+    schedule: "15 21 * * 1-5"     # 21:15 UTC (covers EST close)
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.data_fetch update
+
+  # Every minute on weekdays — tick_once() handles open/closed & daily reset
+  - name: intraday-ticks
+    env: python
+    schedule: "*/1 * * * 1-5"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.live tick
+
+  # Intraday updates (every minute on weekdays).
+  # Writes/updates data/raw/intraday/latest_data_tickers.parquet
+  - name: intraday-ticks
+    env: python
+    schedule: "*/1 * * * 1-5"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.live tick
+
+  # Append official daily bar after NY close (DST covered by two runs).
+  - name: eod-append-2015
+    env: python
+    schedule: "15 20 * * 1-5"   # 20:15 UTC ≈ 4:15pm ET in summer
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.data_fetch update
+
+  - name: eod-append-2115
+    env: python
+    schedule: "15 21 * * 1-5"   # 21:15 UTC ≈ 4:15pm ET in winter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.data_fetch update
+
+  # Intraday updates: writes/updates data/raw/intraday/latest_data_tickers.parquet
+  - name: intraday-ticks
+    env: python
+    schedule: "*/1 * * * 1-5"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.live tick
+
+  # Daily official EOD append (your src/data_fetch.py update mode)
+  - name: eod-append-2015
+    env: python
+    schedule: "15 20 * * 1-5"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.data_fetch update
+
+  - name: eod-append-2115
+    env: python
+    schedule: "15 21 * * 1-5"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.data_fetch update
