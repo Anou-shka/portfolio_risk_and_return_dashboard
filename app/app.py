@@ -1,6 +1,28 @@
 # app/app_2.py — Beautified layout
 from __future__ import annotations
 
+import os, streamlit as st
+
+ACCESS_CODE = os.getenv("APP_ACCESS_CODE", "")
+
+def require_access_code():
+    if not ACCESS_CODE:
+        return
+    if not st.session_state.get("auth_ok"):
+        st.set_page_config(page_title="Portfolio Pulse", layout="wide", initial_sidebar_state="expanded")
+        st.title("🔒 Portfolio Pulse")
+        pwd = st.text_input("Enter access code", type="password")
+        if st.button("Enter"):
+            if pwd == ACCESS_CODE:
+                st.session_state.auth_ok = True
+                st.rerun()
+            else:
+                st.error("Incorrect code")
+        st.stop()
+
+require_access_code()
+
+
 # ---- path shim so "import src" works no matter where you run this ----
 import os, sys
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
