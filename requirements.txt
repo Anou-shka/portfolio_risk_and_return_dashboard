@@ -1,12 +1,28 @@
+# --- Core app ---
 streamlit>=1.28.0
-pandas>=1.5.0
+pandas>=2.0
 numpy>=1.24.0
-yfinance>=0.2.0
 plotly>=5.15.0
-matplotlib>=3.7.0
-seaborn>=0.12.0
-scipy>=1.10.0
-statsmodels>=0.14.0
-python-dateutil>=2.8.0
+
+# --- Data sources & utils ---
+yfinance>=0.2.0
 requests>=2.31.0
+python-dateutil>=2.8.0
 PyYAML>=6.0.1
+pyarrow>=12.0.0         # required for read_parquet / to_parquet
+tzdata>=2024.1          # ensures America/New_York tz data is present
+
+# --- Optimization (efficient frontier uses scipy.optimize) ---
+scipy>=1.10.0
+
+# --- Optional: backend API (only if you actually run app.py as an API) ---
+# fastapi>=0.110
+# uvicorn[standard]>=0.23
+# gunicorn>=20.1
+
+# --- Optional: only if you plot with them (your app uses Plotly already) ---
+# matplotlib>=3.7.0
+# seaborn>=0.12.0
+
+# --- Optional: only if you add econometrics later ---
+# statsmodels>=0.14.0

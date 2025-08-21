@@ -10,13 +10,13 @@ risk_free_rate_annual: 0.04  # 4% per year
 default_weights:
   AAPL:  0.10
   MSFT:  0.10
-  JNJ:   0.08
-  JPM:   0.08
-  XOM:   0.08
-  AMZN:  0.12
+  JNJ:   0.10
+  JPM:   0.10
+  XOM:   0.10
+  AMZN:  0.10
   GOOGL: 0.10
-  TSLA:  0.08
-  SPY:   0.16
+  TSLA:  0.10
+  SPY:   0.10
   GLD:   0.10
 
 metadata:
