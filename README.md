@@ -15,7 +15,7 @@ It ingests **historical** and **intraday** market data, computes core stats (Sha
 * **Diversification:** sector/region pies from metadata; per-asset table with key stats
 * **Live tab:** intraday portfolio vs benchmark (1-minute data during US market hours)
 
-**Visit the live dashboard:** [Portfolio Pulse on Render](https://portfolio-risk-and-return-dashboard.onrender.com)
+**Visit the live dashboard:** [Portfolio Pulse on Render](https://portfolio-pulse.onrender.com)
 
 ## Features
 
