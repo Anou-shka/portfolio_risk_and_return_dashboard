@@ -2,8 +2,9 @@ services:
   - type: web
     name: portfolio-pulse
     env: python
-    plan: starter             # use a paid plan so it stays running
+    plan: free             # use a paid plan so it stays running
     autoDeploy: true
+    autoIdleTimeoutSeconds: 0  # Prevents auto-shutdown
 
     buildCommand: |
       pip install --upgrade pip
