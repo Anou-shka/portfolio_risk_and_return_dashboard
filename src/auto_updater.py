@@ -69,3 +69,32 @@ def start_auto_updater() -> None:
     t = threading.Thread(target=_auto_loop, args=(stop_event,), daemon=True, name="auto-updater")
     t.start()
     start_auto_updater._started = True  # type: ignore[attr-defined]
+
+# src/auto_updater.py
+import time, datetime as dt
+from zoneinfo import ZoneInfo
+from src.data_fetch import update_parquet_daily
+
+def _sleeps():
+    ny = ZoneInfo("America/New_York")
+    while True:
+        now = dt.datetime.now(ny)
+        # run ~16:10 NY time to allow final bars to post
+        target = now.replace(hour=16, minute=10, second=0, microsecond=0)
+        if now >= target:
+            target += dt.timedelta(days=1)
+        yield max(60, (target - now).total_seconds())
+
+def main():
+    print("[scheduler] EOD loop started", flush=True)
+    for s in _sleeps():
+        time.sleep(s)
+        try:
+            print("[scheduler] EOD:", update_parquet_daily(force=False), flush=True)
+        except Exception as e:
+            print("[scheduler] EOD error:", e, flush=True)
+        time.sleep(600)  # avoid multiple runs in the same minute
+
+if __name__ == "__main__":
+    main()
+
