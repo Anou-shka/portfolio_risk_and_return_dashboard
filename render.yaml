@@ -2,60 +2,58 @@ services:
   - type: web
     name: portfolio-pulse
     env: python
-    # Optional: pick a region close to you
-    # region: oregon
-    plan: starter
+    plan: starter             # use a paid plan so it stays running
     autoDeploy: true
 
-    # Install deps
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
 
-    # Run intraday daemon + nightly EOD updater + Streamlit in ONE service
     startCommand: |
       bash -lc '
+        set -e
         mkdir -p data/raw/intraday data/processed
 
-        # 1) Seed 3y history once if missing (idempotent).
+        # Seed 3y history once if missing (idempotent)
         python -m src.data_fetch init || true
 
-        # 2) Intraday daemon: writes data/raw/intraday/latest_data_tickers.parquet
-        #    Your code auto-resets to today at first open and no-ops when market is closed.
+        # Intraday daemon: writes data/raw/intraday/latest_data_tickers.parquet
         python -m src.live daemon --interval 60 &
 
-        # 3) Nightly EOD updater: runs shortly after 4:00pm New York
-        #    so daily bars get appended to data/processed/* parquet files.
+        # Nightly EOD updater (run shortly after 4:00pm New York)
         python - << "PY" &
 import time, datetime as dt
 from zoneinfo import ZoneInfo
 from src.data_fetch import update_parquet_daily
 
-def seconds_until_next_close_plus(buffer_minutes=10):
+def sleeps():
     ny = ZoneInfo("America/New_York")
     while True:
         now = dt.datetime.now(ny)
-        # aim for 16:10 NY time (4:10pm) to give vendors time to post final bars
         target = now.replace(hour=16, minute=10, second=0, microsecond=0)
         if now >= target:
-            target = target + dt.timedelta(days=1)
+            target += dt.timedelta(days=1)
         yield max(60, (target - now).total_seconds())
 
-for sleep_sec in seconds_until_next_close_plus():
-    time.sleep(sleep_sec)
+for s in sleeps():
+    time.sleep(s)
     try:
         print("[scheduler] EOD:", update_parquet_daily(force=False), flush=True)
     except Exception as e:
         print("[scheduler] EOD error:", e, flush=True)
-    # snooze a bit to avoid multiple runs the same minute
     time.sleep(600)
 PY
 
-        # 4) Launch Streamlit app
+        # (Optional) Backend on internal port 8000 (FastAPI/Flask exposing app=...)
+        if [ -f app.py ]; then
+          gunicorn app:app -w 1 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 &
+        fi
+
+        # Launch Streamlit (public)
         streamlit run app/app_2.py --server.port $PORT --server.address 0.0.0.0
       '
 
-    # Persistent storage so all three processes see the same files
+    # Persistent disk so all processes share /data
     disk:
       name: data-disk
       mountPath: /opt/render/project/src/data
@@ -68,3 +66,7 @@ PY
         value: "false"
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: BACKEND_URL
+        value: "http://127.0.0.1:8000"
+      - key: APP_ACCESS_CODE
+        value: "anoushka"
