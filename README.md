@@ -50,16 +50,6 @@ python -m src.data_fetch update
 # For testing off-hours: python -m src.data_fetch update --force
 ```
 
-## Deploy on Render
-
-This repo includes **render.yaml**. Create a Web Service from the repo; it will:
-* Seed history (`src.data_fetch init`)
-* Run the intraday daemon (`src.live daemon`) in the background
-* Run a nightly EOD updater after NY close
-* Serve Streamlit publicly
-
-Attach a **persistent disk** mounted at `/opt/render/project/src/data`.
-
 ### Environment Variables
 
 * `PYTHONUNBUFFERED=1`
