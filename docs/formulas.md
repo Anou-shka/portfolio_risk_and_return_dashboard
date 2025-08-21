@@ -319,7 +319,4 @@ $$\tilde{W}_g = \frac{W_g}{\sum_{g'} W_{g'}}$$
 
 ---
 
-**Why this works:** it replaces `\operatorname{...}` with plain `\text{...}` or uses standard forms like $\sqrt{\text{Var}(\cdot)}$. Those are accepted by KaTeX/MathJax in Streamlit/Render without enabling extra macros.
-
-
 *This document matches the implementation shipped with the project and is meant as a precise, beginner-friendly reference to how each number is computed.*
