@@ -23,10 +23,33 @@ DATA = ROOT / "data"
 DIR_PROCESSED = DATA / "processed"
 DIR_PROCESSED.mkdir(parents=True, exist_ok=True)
 
-# ---- settings ----
-CUTOFF_DATE = pd.Timestamp("2025-08-20")                  # inclusive
-START_DATE  = (CUTOFF_DATE - pd.DateOffset(years=3))
-END_DATE    = (CUTOFF_DATE + pd.Timedelta(days=1))        # yfinance end is exclusive
+# --- dynamic cutoff tied to New York trading day ---
+from zoneinfo import ZoneInfo
+import datetime as dt
+
+def _latest_cutoff_date_ny(buffer_minutes: int = 10) -> pd.Timestamp:
+    """
+    Returns the latest trading date to use as cutoff:
+      - On trading days AFTER ~16:00 NY (plus small buffer), returns today.
+      - Before close or on weekends, rolls back to the previous weekday.
+    """
+    ny = ZoneInfo("America/New_York")
+    now = dt.datetime.now(ny)
+    cutoff = now.date()
+
+    # Before 16:00 NY (plus buffer), use yesterday
+    if (now.hour, now.minute) < (16, buffer_minutes):
+        cutoff = cutoff - dt.timedelta(days=1)
+
+    # Roll back across weekends
+    while cutoff.weekday() >= 5:  # 5=Sat, 6=Sun
+        cutoff = cutoff - dt.timedelta(days=1)
+
+    return pd.Timestamp(cutoff)
+
+CUTOFF_DATE = _latest_cutoff_date_ny()
+START_DATE  = CUTOFF_DATE - pd.DateOffset(years=3)
+END_DATE    = CUTOFF_DATE + pd.Timedelta(days=1)  # yfinance 'end' is exclusive
 FIELDS      = ["Open", "High", "Low", "Close", "Adj Close"]
 
 COL_PATH = DIR_PROCESSED / f"historical_3y_to_{CUTOFF_DATE.date()}_column.parquet"  # (field, ticker)
