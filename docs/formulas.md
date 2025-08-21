@@ -262,21 +262,17 @@ Given aligned daily series over a rolling window $W$:
 
 ### Minute-by-minute return since prior close
 
-Let last traded price at minute $t$ be $L_t$, and prior official **Adj Close** be $C_{\text{prev}}$.
+Let last traded price at minute t be $L_t$, and prior official **Adj Close** be $C_{\text{prev}}$.
 
-$$
-r^{(\text{intra})}_t \;=\; \frac{L_t}{C_{\text{prev}}} - 1 .
-$$
+$$r^{(\text{intra})}_t = \frac{L_t}{C_{\text{prev}}} - 1$$
 
-> In code: `intraday_return_matrix(intra_close, prev_close_map)`.
+In code: `intraday_return_matrix(intra_close, prev_close_map)`.
 
 ### Portfolio intraday return & drifted weights
 
-$$
-r^{(p,\text{intra})}_t \;=\; \sum_i w_i\, r^{(\text{intra})}_{i,t},
-\qquad
-w_i^{(\text{drift})} \;\propto\; w_i \cdot \big(1 + r^{(\text{intra})}_{i,t}\big)
-$$
+$$r^{(p,\text{intra})}_t = \sum_i w_i \cdot r^{(\text{intra})}_{i,t}$$
+
+$$w_i^{(\text{drift})} \propto w_i \cdot \left(1 + r^{(\text{intra})}_{i,t}\right)$$
 
 (then renormalize to sum to 1.)
 
@@ -298,11 +294,9 @@ $$
 
 Group weights by a label $g(i)$ (e.g., sector or region) and normalize:
 
-$$
-W_g \;=\; \sum_{i:\, g(i)=g} w_i, 
-\qquad
-\tilde{W}_g \;=\; \frac{W_g}{\sum_{g'} W_{g'}} .
-$$
+$$W_g = \sum_{i: g(i)=g} w_i$$
+
+$$\tilde{W}_g = \frac{W_g}{\sum_{g'} W_{g'}}$$
 
 > In code: `aggregate_by_metadata(weights, metadata, field="sector")`.
 

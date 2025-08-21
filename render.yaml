@@ -69,5 +69,5 @@ PY
         value: "1"
       - key: BACKEND_URL
         value: "http://127.0.0.1:8000"
-      # - key: APP_ACCESS_CODE
-      #   value: "0000"
+
+   # - key: APP_ACCESS_CODE value: "0000"
