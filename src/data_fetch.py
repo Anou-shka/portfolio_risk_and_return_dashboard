@@ -24,13 +24,13 @@ DIR_PROCESSED = DATA / "processed"
 DIR_PROCESSED.mkdir(parents=True, exist_ok=True)
 
 # ---- settings ----
-CUTOFF_DATE = pd.Timestamp("2025-08-18")                  # inclusive
+CUTOFF_DATE = pd.Timestamp("2025-08-20")                  # inclusive
 START_DATE  = (CUTOFF_DATE - pd.DateOffset(years=3))
 END_DATE    = (CUTOFF_DATE + pd.Timedelta(days=1))        # yfinance end is exclusive
 FIELDS      = ["Open", "High", "Low", "Close", "Adj Close"]
 
 COL_PATH = DIR_PROCESSED / f"historical_3y_to_{CUTOFF_DATE.date()}_column.parquet"  # (field, ticker)
-TIC_PATH = DIR_PROCESSED / f"historical_3y_to_{CUTOFF_DATE.date()}_ticker.parquet"  # (ticker, field)
+# TIC_PATH = DIR_PROCESSED / f"historical_3y_to_{CUTOFF_DATE.date()}_ticker.parquet"  # (ticker, field)
 
 
 # ------------------------
@@ -134,7 +134,7 @@ def _is_past_close_ny(now_utc: Optional[dt.datetime] = None) -> bool:
 # ------------------------
 def ensure_history_to_cutoff() -> None:
     """Write both processed parquet files up to CUTOFF_DATE (idempotent)."""
-    if COL_PATH.exists() and TIC_PATH.exists():
+    if COL_PATH.exists():
         print("[init] processed files already exist — nothing to do.")
         return
 
@@ -143,10 +143,10 @@ def ensure_history_to_cutoff() -> None:
     df_tic = _download_range(symbols, group_by="ticker")   # (ticker, field)
 
     df_col.to_parquet(COL_PATH, index=True, compression="gzip")
-    df_tic.to_parquet(TIC_PATH, index=True, compression="gzip")
+    # df_tic.to_parquet(TIC_PATH, index=True, compression="gzip")
 
     print(f"[init] wrote {COL_PATH}  shape={df_col.shape}")
-    print(f"[init] wrote {TIC_PATH}  shape={df_tic.shape}")
+    # print(f"[init] wrote {TIC_PATH}  shape={df_tic.shape}")
 
 
 def update_parquet_daily(force: bool = False) -> str:
@@ -156,7 +156,7 @@ def update_parquet_daily(force: bool = False) -> str:
     Use `force=True` to try regardless of time.
     """
     # ensure base history exists
-    if not (COL_PATH.exists() and TIC_PATH.exists()):
+    if not (COL_PATH.exists()):
         ensure_history_to_cutoff()
 
     today = dt.datetime.now(dt.timezone.utc).date()
@@ -187,7 +187,7 @@ def update_parquet_daily(force: bool = False) -> str:
     day_tic = day_col.swaplevel(0, 1, axis=1).sort_index(axis=1)
 
     _append_or_replace_date(COL_PATH, day_col, today)
-    _append_or_replace_date(TIC_PATH, day_tic, today)
+    # _append_or_replace_date(TIC_PATH, day_tic, today)
 
     return f"Appended official bar for {today}."
 
