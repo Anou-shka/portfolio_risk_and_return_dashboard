@@ -7,6 +7,7 @@ import datetime as dt
 from datetime import timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
+import time
 from typing import List
 
 import pandas as pd
@@ -54,11 +55,20 @@ def _now_utc() -> dt.datetime:
 def _now_ny() -> dt.datetime:
     return _now_utc().astimezone(ZoneInfo("America/New_York"))
 
-def market_is_open() -> bool:
+def is_crypto(symbol: str) -> bool:
+    """True for tickers with a -USD suffix (BTC-USD, ETH-USD, SOL-USD, …)."""
+    return symbol.upper().endswith("-USD")
+
+
+def market_is_open(symbols: List[str] | None = None) -> bool:
     """
-    Simple NYSE gate: Mon-Fri, 09:30–16:00 America/New_York.
-    (Good enough for automation; holidays still return False because no data will arrive.)
+    NYSE gate: Mon-Fri, 09:30–16:00 America/New_York.
+    If every symbol in `symbols` is a crypto (-USD) ticker, returns True
+    unconditionally because crypto markets trade 24/7.
+    Existing callers that pass no arguments retain the original equity behavior.
     """
+    if symbols and all(is_crypto(s) for s in symbols):
+        return True
     now = _now_ny()
     if now.weekday() >= 5:
         return False
@@ -114,13 +124,13 @@ def fetch_latest_data(tickers: List[str]) -> pd.DataFrame:
     df = df[~df.index.duplicated(keep="last")]
     return df
 
-def _append_parquet_atomic(path: Path, new_df: pd.DataFrame) -> None:
+def _append_parquet_atomic(path: Path, new_df: pd.DataFrame) -> tuple[int, int]:
     """
     Append by read→concat→dedupe→sort, write atomically via temp file.
+    Returns the shape of the resulting file.
     """
     if path.exists():
         old = pd.read_parquet(path)
-        # ensure both have same column order
         old = _ensure_intraday_columns(old)
         combined = pd.concat([old, new_df], axis=0)
         combined = combined[~combined.index.duplicated(keep="last")].sort_index()
@@ -130,6 +140,7 @@ def _append_parquet_atomic(path: Path, new_df: pd.DataFrame) -> None:
     tmp = path.with_suffix(".tmp.parquet")
     combined.to_parquet(tmp, index=True, compression="gzip")
     tmp.replace(path)
+    return combined.shape
 
 def _reset_if_new_trading_day(path: Path) -> None:
     """
@@ -176,8 +187,7 @@ def tick_once() -> str:
     if df.empty:
         return "no_data"
 
-    _append_parquet_atomic(RAW_FILE, df)
-    shape = pd.read_parquet(RAW_FILE).shape
+    shape = _append_parquet_atomic(RAW_FILE, df)
     return f"appended rows; file shape={shape}"
 
 
@@ -196,9 +206,7 @@ def _daemon_loop(sleep_sec: int = 60):
         except Exception as e:
             print(f"[{_now_utc().isoformat()}] error: {e}")
         finally:
-            # sleep irrespective of success
-            import time as _time
-            _time.sleep(max(10, sleep_sec))
+            time.sleep(max(10, sleep_sec))
 
 def _reset_today():
     """Clear the parquet to only today's NY-local rows (if any)."""

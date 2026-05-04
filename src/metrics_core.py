@@ -73,8 +73,10 @@ def beta_alpha(port: pd.Series, bench: pd.Series, rf_annual=0.0) -> Tuple[float,
     return float(beta), float(alpha)
 
 def tracking_error(port: pd.Series, bench: pd.Series) -> float:
-    spread = (pd.concat([port, bench], axis=1).dropna().pipe(lambda d: d.iloc[:,0]-d.iloc[:,1]))
-    if spread.empty: return np.nan
+    df = pd.concat([port, bench], axis=1).dropna()
+    spread = df.iloc[:, 0] - df.iloc[:, 1]
+    if spread.empty:
+        return np.nan
     return spread.std(ddof=1) * np.sqrt(TRADING_DAYS)
 
 def information_ratio(port: pd.Series, bench: pd.Series) -> float:
@@ -116,38 +118,62 @@ def risk_contributions(weights, cov: pd.DataFrame) -> pd.Series:
     return pd.Series(rc, index=cov.columns)
 
 def optimize_min_variance(returns: pd.DataFrame, bounds=(0.0, 1.0)) -> pd.Series:
-    if not _HAVE_SCIPY: return pd.Series(np.nan, index=returns.columns)
-    S = returns.cov().values; n = len(returns.columns)
-    def f(w): return float(w @ S @ w)
-    cons = [{"type":"eq","fun":lambda w: np.sum(w) - 1}]
-    res = minimize(f, x0=np.repeat(1/n, n), method="SLSQP", bounds=[bounds]*n, constraints=cons)
+    if not _HAVE_SCIPY:
+        return pd.Series(np.nan, index=returns.columns)
+    S = returns.cov().values
+    n = len(returns.columns)
+
+    def min_var(w):
+        return float(w @ S @ w)
+
+    cons = [{"type": "eq", "fun": lambda w: np.sum(w) - 1}]
+    res = minimize(min_var, x0=np.repeat(1 / n, n), method="SLSQP", bounds=[bounds] * n, constraints=cons)
     x = res.x if res.success else np.full(n, np.nan)
     return pd.Series(x, index=returns.columns)
 
-def optimize_max_sharpe(returns: pd.DataFrame, rf_annual=0.0, bounds=(0.0,1.0)) -> pd.Series:
-    if not _HAVE_SCIPY: return pd.Series(np.nan, index=returns.columns)
-    mu_d, S = returns.mean().values, returns.cov().values
-    rf_d = rf_annual/ TRADING_DAYS; n=len(mu_d)
-    def negS(w):
-        num = w @ (mu_d - rf_d); den = np.sqrt(w @ S @ w) + 1e-12
-        return -num/den
-    cons=[{"type":"eq","fun":lambda w: np.sum(w)-1}]
-    res = minimize(negS, x0=np.repeat(1/n,n), method="SLSQP", bounds=[bounds]*n, constraints=cons)
+def optimize_max_sharpe(returns: pd.DataFrame, rf_annual=0.0, bounds=(0.0, 1.0)) -> pd.Series:
+    if not _HAVE_SCIPY:
+        return pd.Series(np.nan, index=returns.columns)
+    mu_d = returns.mean().values
+    S = returns.cov().values
+    rf_d = rf_annual / TRADING_DAYS
+    n = len(mu_d)
+
+    def neg_sharpe(w):
+        num = w @ (mu_d - rf_d)
+        den = np.sqrt(w @ S @ w) + 1e-12
+        return -num / den
+
+    cons = [{"type": "eq", "fun": lambda w: np.sum(w) - 1}]
+    res = minimize(neg_sharpe, x0=np.repeat(1 / n, n), method="SLSQP", bounds=[bounds] * n, constraints=cons)
     x = res.x if res.success else np.full(n, np.nan)
     return pd.Series(x, index=returns.columns)
 
-def trace_efficient_frontier(returns: pd.DataFrame, n_points=40, bounds=(0.0,1.0)) -> pd.DataFrame:
-    if not _HAVE_SCIPY: return pd.DataFrame(columns=["ret_ann","vol_ann","weights"])
-    mu_a = returns.mean()*TRADING_DAYS; S = returns.cov()*TRADING_DAYS; n=len(returns.columns)
-    grid = np.linspace(mu_a.min(), mu_a.max(), n_points); out=[]
-    def var_w(w): return float(w @ S.values @ w)
+def trace_efficient_frontier(returns: pd.DataFrame, n_points=40, bounds=(0.0, 1.0), shrink=0.0) -> pd.DataFrame:
+    if not _HAVE_SCIPY:
+        return pd.DataFrame(columns=["ret_ann", "vol_ann", "weights"])
+    mu_a = returns.mean() * TRADING_DAYS
+    S = cov_matrix(returns, shrink=shrink) * TRADING_DAYS
+    n = len(returns.columns)
+    grid = np.linspace(mu_a.min(), mu_a.max(), n_points)
+    out = []
+
+    def var_w(w):
+        return float(w @ S.values @ w)
+
     for t in grid:
-        cons=[{"type":"eq","fun":lambda w,tt=t: float(w @ mu_a.values - tt)},
-              {"type":"eq","fun":lambda w: np.sum(w)-1}]
-        res=minimize(var_w, x0=np.repeat(1/n,n), method="SLSQP", bounds=[bounds]*n, constraints=cons)
+        cons = [
+            {"type": "eq", "fun": lambda w, tt=t: float(w @ mu_a.values - tt)},
+            {"type": "eq", "fun": lambda w: np.sum(w) - 1},
+        ]
+        res = minimize(var_w, x0=np.repeat(1 / n, n), method="SLSQP", bounds=[bounds] * n, constraints=cons)
         if res.success:
-            w=res.x
-            out.append({"ret_ann":float(w @ mu_a.values), "vol_ann":float(np.sqrt(var_w(w))), "weights":pd.Series(w,index=returns.columns)})
+            w = res.x
+            out.append({
+                "ret_ann": float(w @ mu_a.values),
+                "vol_ann": float(np.sqrt(var_w(w))),
+                "weights": pd.Series(w, index=returns.columns),
+            })
     return pd.DataFrame(out)
 
 def mc_var_es(returns: pd.DataFrame, weights, alpha=0.95, horizon_days=1, n_sims=10000, seed=None) -> Tuple[float,float]:

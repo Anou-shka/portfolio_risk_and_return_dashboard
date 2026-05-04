@@ -23,31 +23,8 @@ DATA = ROOT / "data"
 DIR_PROCESSED = DATA / "processed"
 DIR_PROCESSED.mkdir(parents=True, exist_ok=True)
 
-# --- dynamic cutoff tied to New York trading day ---
-from zoneinfo import ZoneInfo
-import datetime as dt
-
-def _latest_cutoff_date_ny(buffer_minutes: int = 10) -> pd.Timestamp:
-    """
-    Returns the latest trading date to use as cutoff:
-      - On trading days AFTER ~16:00 NY (plus small buffer), returns today.
-      - Before close or on weekends, rolls back to the previous weekday.
-    """
-    ny = ZoneInfo("America/New_York")
-    now = dt.datetime.now(ny)
-    cutoff = now.date()
-
-    # Before 16:00 NY (plus buffer), use yesterday
-    if (now.hour, now.minute) < (16, buffer_minutes):
-        cutoff = cutoff - dt.timedelta(days=1)
-
-    # Roll back across weekends
-    while cutoff.weekday() >= 5:  # 5=Sat, 6=Sun
-        cutoff = cutoff - dt.timedelta(days=1)
-
-    return pd.Timestamp(cutoff)
-
-CUTOFF_DATE = _latest_cutoff_date_ny()
+# --- date window: always 3 years back from today ---
+CUTOFF_DATE = pd.Timestamp(dt.date.today())
 START_DATE  = CUTOFF_DATE - pd.DateOffset(years=3)
 END_DATE    = CUTOFF_DATE + pd.Timedelta(days=1)  # yfinance 'end' is exclusive
 FIELDS      = ["Open", "High", "Low", "Close", "Adj Close"]
@@ -64,7 +41,7 @@ def _symbols() -> List[str]:
 
 
 def _download_range(symbols: List[str], group_by: str) -> pd.DataFrame:
-    """Download [START_DATE, CUTOFF_DATE] OHLC + Adj Close; drop Volume; enforce order."""
+    """Download 3-year window of OHLC + Adj Close ending today."""
     df = yf.download(
         symbols,
         start=START_DATE.strftime("%Y-%m-%d"),
@@ -156,20 +133,22 @@ def _is_past_close_ny(now_utc: Optional[dt.datetime] = None) -> bool:
 # Public entry points
 # ------------------------
 def ensure_history_to_cutoff() -> None:
-    """Write both processed parquet files up to CUTOFF_DATE (idempotent)."""
+    """Write the processed column-oriented parquet up to today (idempotent)."""
     if COL_PATH.exists():
-        print("[init] processed files already exist — nothing to do.")
+        print("[init] processed file already exists — nothing to do.")
         return
 
     symbols = _symbols()
-    df_col = _download_range(symbols, group_by="column")   # (field, ticker)
-    df_tic = _download_range(symbols, group_by="ticker")   # (ticker, field)
+    if not symbols:
+        print("[init] no tickers configured — skipping parquet init.")
+        return
 
+    df_col = _download_range(symbols, group_by="column")
     df_col.to_parquet(COL_PATH, index=True, compression="gzip")
-    # df_tic.to_parquet(TIC_PATH, index=True, compression="gzip")
-
-    print(f"[init] wrote {COL_PATH}  shape={df_col.shape}")
-    # print(f"[init] wrote {TIC_PATH}  shape={df_tic.shape}")
+    print(
+        f"[init] wrote {COL_PATH}  shape={df_col.shape} "
+        f"| range: {df_col.index[0].date()} → {df_col.index[-1].date()}"
+    )
 
 
 def update_parquet_daily(force: bool = False) -> str:

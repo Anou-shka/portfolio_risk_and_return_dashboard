@@ -1,36 +1,10 @@
-tickers: ["AAPL", "MSFT", "JNJ", "JPM", "XOM", "AMZN", "GOOGL", "TSLA", "SPY", "GLD"]
-
 benchmarks:
   "^GSPC": "S&P 500 Index (US)"
-  
-default_benchmark: "^GSPC" 
+
+default_benchmark: "^GSPC"
 
 risk_free_rate_annual: 0.04  # 4% per year
 
-default_weights:
-  AAPL:  0.10
-  MSFT:  0.10
-  JNJ:   0.10
-  JPM:   0.10
-  XOM:   0.10
-  AMZN:  0.10
-  GOOGL: 0.10
-  TSLA:  0.10
-  SPY:   0.10
-  GLD:   0.10
-
-metadata:
-  AAPL:  { sector: "Information Technology", region: "US" }
-  MSFT:  { sector: "Information Technology", region: "US" }
-  JNJ:   { sector: "Health Care",            region: "US" }
-  JPM:   { sector: "Financials",             region: "US" }
-  XOM:   { sector: "Energy",                 region: "US" }
-  AMZN:  { sector: "Consumer Discretionary", region: "US" }
-  GOOGL: { sector: "Communication Services", region: "US" }
-  TSLA:  { sector: "Consumer Discretionary", region: "US" }
-  SPY:   { sector: "ETF (US Broad Market)",  region: "US" }
-  GLD:   { sector: "Commodity (Gold)",       region: "Global" }
-
 refresh_interval:
-  market_open: 60      # refresh every 60s when market is open
-  market_closed: 900   # refresh every 15 min when market is closed
+  market_open: 60      # seconds between intraday ticks when market is open
+  market_closed: 900   # seconds between checks when market is closed

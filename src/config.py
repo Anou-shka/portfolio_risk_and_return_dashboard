@@ -17,7 +17,9 @@ BENCHMARKS: Dict[str, str]
 DEFAULT_BENCH: str
 RF_ANN_PCT: float
 METADATA: Dict[str, Dict[str, str]]
-DEFAULT_WEIGHTS: Dict[str, float]  # optional but handy
+DEFAULT_WEIGHTS: Dict[str, float]
+REFRESH_SEC_MARKET: int
+REFRESH_SEC_CLOSED: int
 
 # ---------- internal helpers ----------
 def _read_yaml(path: Path) -> Dict[str, Any]:
@@ -67,13 +69,10 @@ def _load() -> None:
     """Populate module-level constants from YAML with light validation."""
     cfg = _read_yaml(CONFIG_PATH)
 
-    # ---- tickers
-    tickers = cfg.get("tickers")
-    if not isinstance(tickers, list) or not tickers:
-        raise ValueError("`tickers` must be a non-empty list in portfolio.yaml")
-    tickers = [str(t).strip() for t in tickers]
+    # ---- tickers (optional — app manages its own ticker list dynamically)
+    tickers_raw = cfg.get("tickers", []) or []
+    tickers = [str(t).strip() for t in tickers_raw if t]
 
-    # duplicates check
     dups = _find_duplicates(tickers)
     if dups:
         raise ValueError(f"`tickers` contains duplicates: {dups}")

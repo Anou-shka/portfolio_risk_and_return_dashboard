@@ -14,7 +14,8 @@ PROC = ROOT / "data" / "processed"
 RAW  = ROOT / "data" / "raw" / "intraday"
 
 # defaults/filenames (adjust if you changed them)
-PROCESSED_COLUMN = max((PROC.glob("historical_3y_to_*_column.parquet")), key=lambda p: p.stat().st_mtime)
+_cands = sorted(PROC.glob("historical_3y_to_*_column.parquet"), key=lambda p: p.stat().st_mtime)
+PROCESSED_COLUMN = _cands[-1] if _cands else None
 INTRADAY_FILE   = RAW / "latest_data_tickers.parquet"
 
 FIELDS = ["Open","High","Low","Close","Adj Close"]
@@ -26,6 +27,8 @@ def _extract_prices_adj_from_column(df: pd.DataFrame, symbols: List[str]) -> pd.
     return px.loc[:, cols].sort_index()
 
 def load_prices_adj(symbols: List[str]) -> pd.DataFrame:
+    if PROCESSED_COLUMN is None:
+        raise FileNotFoundError("No processed parquet found. Run `python -m src.data_fetch init` first.")
     df = pd.read_parquet(PROCESSED_COLUMN)
     return _extract_prices_adj_from_column(df, symbols)
 
@@ -124,11 +127,6 @@ def live_portfolio_metrics(
     }
 
 
-# --- add to src/metrics_active.py ---
-from typing import List, Dict
-import pandas as pd
-import numpy as np
-from pathlib import Path
 
 def intraday_close_matrix(intraday_path: Path, symbols: List[str]) -> pd.DataFrame:
     """
