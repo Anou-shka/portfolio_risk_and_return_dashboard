@@ -850,25 +850,34 @@ with tab_live:
     _intra_file_usable = False   # set to True only when file exists and is fresh today
 
     if (INTRA := intraday_file_path()).exists():
-        # Check staleness before loading — if the file isn't from today, treat it
-        # as missing rather than silently showing old data as "live".
-        mtime_ny = pd.Timestamp(INTRA.stat().st_mtime, unit="s", tz="UTC").tz_convert("America/New_York")
-        _cache_date = mtime_ny.date()
-        _cache_is_stale = _cache_date < _today()
+        # Load first so we can check the actual data dates — git sets mtime to
+        # checkout time on every deploy, so file mtime is always "today" and
+        # cannot be trusted as a freshness signal.
+        last, intra_close = load_intraday_cached(str(INTRA), tuple(ALL_SYMS))
+
+        if not intra_close.empty:
+            # Determine the NY-local date of the newest data row
+            _last_ts = intra_close.index.max()
+            if getattr(_last_ts, "tz", None) is None:
+                _last_ts = pd.Timestamp(_last_ts).tz_localize("UTC")
+            _cache_date = _last_ts.tz_convert(_NY).date()
+            _cache_is_stale = _cache_date < _today()
+        else:
+            _cache_date = None
+            _cache_is_stale = True
 
         if _cache_is_stale:
+            _stale_label = str(_cache_date) if _cache_date else "an unknown date"
             st.warning(
-                f"⚠️ Intraday cache is from **{_cache_date}** — it is stale and has been ignored. "
-                "Start the daemon (`python -m src.live daemon`) during market hours to get live data. "
-                "Showing today's return from daily price data instead."
+                f"⚠️ Intraday cache contains data from **{_stale_label}** — it is stale "
+                "and has been ignored. The daemon writes fresh data during NYSE hours "
+                "(09:30–16:00 ET). Showing today's return from daily price data instead."
             )
-            # Fall through to the daily-data fallback below by pretending file doesn't exist
             _intra_file_usable = False
         else:
             _intra_file_usable = True
 
         if _intra_file_usable:
-            last, intra_close = load_intraday_cached(str(INTRA), tuple(ALL_SYMS))
             if not intra_close.empty:
                 if win_opt != "Full day":
                     start_ts = intra_close.index.max() - pd.Timedelta(minutes=_mins[win_opt])
@@ -930,7 +939,7 @@ with tab_live:
                             nice_fig(fig_ov, title="Overlay Adj Close — last 7 days", xlab="Date", ylab="Price")
                             st.plotly_chart(fig_ov, use_container_width=True)
 
-                st.caption(f"Cache updated {mtime_ny:%Y-%m-%d %H:%M ET} · rows: {len(intra_close):,}")
+                st.caption(f"Data date: {_cache_date} ET · rows: {len(intra_close):,}")
             else:
                 st.info("Intraday cache exists but is empty for selected symbols.")
         else:
