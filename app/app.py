@@ -8,6 +8,20 @@ import sys
 import datetime as dt
 from pathlib import Path
 from typing import Dict, List
+from zoneinfo import ZoneInfo
+
+# All "today" comparisons use New York time so the date matches the financial
+# market day — Render servers run in UTC, which would show yesterday's date
+# for users ahead of midnight NY time.
+_NY = ZoneInfo("America/New_York")
+
+def _today() -> dt.date:
+    """Current date in America/New_York — consistent on local and Render."""
+    return dt.datetime.now(_NY).date()
+
+def _now() -> dt.datetime:
+    """Current wall-clock time in America/New_York."""
+    return dt.datetime.now(_NY)
 
 import numpy as np
 import pandas as pd
@@ -237,8 +251,8 @@ def fetch_treasury_rate() -> float:
 @st.cache_data(ttl=300, show_spinner="Fetching price history…")
 def fetch_history(syms: tuple[str, ...]) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Download 3 years of daily adjusted close, always ending today. Cached 5 min."""
-    end   = dt.date.today() + dt.timedelta(days=1)           # yfinance end is exclusive
-    start = dt.date.today() - dt.timedelta(days=365 * 3 + 5) # +5 for weekend buffer
+    end   = _today() + dt.timedelta(days=1)           # yfinance end is exclusive
+    start = _today() - dt.timedelta(days=365 * 3 + 5) # +5 for weekend buffer
     df = yf.download(
         list(syms),
         start=start.isoformat(),
@@ -386,7 +400,7 @@ if "metrics_validated" not in st.session_state:
 st.markdown(f"""
 <div class="pp-title">📈 Portfolio Pulse</div>
 <div class="pp-sub">Clean visuals · Quick insights · Actionable risk</div>
-<div class="pp-date">{dt.date.today():%B %d, %Y}</div>
+<div class="pp-date">{_today():%B %d, %Y}</div>
 """, unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -396,7 +410,7 @@ INTRA = intraday_file_path()
 
 with st.sidebar:
     st.markdown("## 📈 Portfolio Pulse")
-    st.caption(f"Today: {dt.date.today():%B %d, %Y}")
+    st.caption(f"Today: {_today():%B %d, %Y}")
 
     # ── 📊 Portfolio ──────────────────────────────────────────────────────
     with st.expander("📊 Portfolio", expanded=True):
@@ -560,7 +574,7 @@ with st.sidebar:
     # ── 🔄 Data ───────────────────────────────────────────────────────────
     with st.expander("🔄 Data", expanded=False):
         st.caption("Price data is auto-refreshed every 5 minutes from Yahoo Finance.")
-        st.caption(f"Session started: {dt.datetime.now():%Y-%m-%d %H:%M:%S}")
+        st.caption(f"Session started: {_now():%Y-%m-%d %H:%M:%S}")
         if st.button("🔄 Refresh Data Now", use_container_width=True, key="btn_refresh"):
             st.cache_data.clear()
             st.rerun()
@@ -583,7 +597,7 @@ if prices_all.empty:
 with st.sidebar:
     with st.expander("🔄 Data", expanded=False):
         last_date = prices_all.index[-1].date()
-        st.success(f"**Last updated:** {dt.datetime.now():%H:%M:%S}")
+        st.success(f"**Last updated:** {_now():%H:%M:%S}")
         st.caption(f"Most recent bar: **{last_date}**")
 
 # Auto-populate metadata for any portfolio ticker missing it
@@ -678,7 +692,7 @@ with tab_perf:
     if is_today:
         # Show today's single-day return from the daily price history
         _prior_idx = (
-            -2 if prices.index[-1].date() == dt.date.today() and len(prices) > 1
+            -2 if prices.index[-1].date() == _today() and len(prices) > 1
             else -1
         )
         _today_row = prices.iloc[-1]
@@ -840,7 +854,7 @@ with tab_live:
         # as missing rather than silently showing old data as "live".
         mtime_ny = pd.Timestamp(INTRA.stat().st_mtime, unit="s", tz="UTC").tz_convert("America/New_York")
         _cache_date = mtime_ny.date()
-        _cache_is_stale = _cache_date < dt.date.today()
+        _cache_is_stale = _cache_date < _today()
 
         if _cache_is_stale:
             st.warning(
@@ -863,7 +877,7 @@ with tab_live:
                 # Prior close reference: if today's daily bar is already in the
                 # history we must step back one row to get yesterday's close.
                 _prior_idx = (
-                    -2 if prices_all.index[-1].date() == dt.date.today() and len(prices_all) > 1
+                    -2 if prices_all.index[-1].date() == _today() and len(prices_all) > 1
                     else -1
                 )
                 prev_map = {
@@ -934,7 +948,7 @@ with tab_live:
         # Fallback: show today's daily return from the price history
         if len(prices_all) >= 2:
             _d_prior_idx = (
-                -2 if prices_all.index[-1].date() == dt.date.today() and len(prices_all) > 1
+                -2 if prices_all.index[-1].date() == _today() and len(prices_all) > 1
                 else -1
             )
             _d_prev  = prices_all.iloc[_d_prior_idx]
@@ -1369,7 +1383,7 @@ st.markdown(
     <footer-bar>
       Data sourced from <b>Yahoo Finance</b> &nbsp;·&nbsp;
       Auto-refreshed every 5 minutes &nbsp;·&nbsp;
-      Last loaded: <b>{dt.datetime.now():%H:%M:%S}</b> &nbsp;·&nbsp;
+      Last loaded: <b>{_now():%H:%M:%S}</b> &nbsp;·&nbsp;
       Portfolio Pulse
     </footer-bar>
     """,
