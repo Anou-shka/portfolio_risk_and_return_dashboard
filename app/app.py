@@ -240,7 +240,9 @@ def fetch_treasury_rate() -> float:
     try:
         hist = yf.Ticker("^TNX").history(period="5d")
         if not hist.empty:
-            return float(hist["Close"].iloc[-1]) / 100.0
+            y = float(hist["Close"].dropna().iloc[-1])
+            # Yahoo quotes ^TNX in percent (4.2 = 4.2%); some feeds use ×10 (42.0).
+            return (y / 1000.0) if y > 20 else (y / 100.0)
     except Exception:
         pass
     return 0.045
@@ -313,9 +315,9 @@ def fetch_history(syms: tuple[str, ...]) -> tuple[pd.DataFrame, pd.DataFrame, pd
     return raw, prices, rets
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=50, show_spinner=False)   # < the 60 s live refresh, so each refresh gets new bars
 def fetch_intraday(syms: tuple[str, ...]) -> pd.DataFrame:
-    """1-minute closes for the last few days (UTC index). Cached 60 s.
+    """1-minute closes for the last few days (UTC index). Cached 50 s.
     Five days guarantees the latest session of every asset is included,
     even on Mondays and after holidays."""
     m = _yf_download(syms, period="5d", interval="1m")
@@ -526,9 +528,10 @@ with st.sidebar:
                 label = f"**{sym}**" + (
                     f"  ·  {name[:18]}" if name and name != sym else ""
                 )
-                c1, c2 = st.columns([5, 1])
+                c1, c2 = st.columns([4, 1], vertical_alignment="center")
                 c1.markdown(label)
-                if c2.button("✕", key=f"rm_{sym}", help=f"Remove {sym}"):
+                # tertiary = no box/padding, so the ✕ isn't clipped in the narrow column
+                if c2.button("✕", key=f"rm_{sym}", help=f"Remove {sym}", type="tertiary"):
                     to_remove = sym
             if to_remove:
                 st.session_state.portfolio_tickers.remove(to_remove)
@@ -931,8 +934,12 @@ with tab_perf:
             st.plotly_chart(fig_rel, width="stretch")
 
 # ════════════════════════════  LIVE  ══════════════════════════════════════
-with tab_live:
+@st.fragment(run_every=60)
+def live_view() -> None:
+    """Live tab. As a fragment it re-runs on its own every 60 s (and on its
+    own widget changes) without re-running the rest of the dashboard."""
     st.subheader("Live Intraday View")
+    st.caption(f"Auto-refreshes every minute · last update {_now():%H:%M:%S} ET")
     win_opt = st.select_slider(
         "Show last…",
         options=["30m", "1h", "2h", "3h", "6h", "Full session"],
@@ -993,6 +1000,10 @@ with tab_live:
         )
         if missing:
             st.caption(f"No intraday data for: {', '.join(missing)} (excluded; weights renormalised).")
+
+
+with tab_live:
+    live_view()
 
 # ════════════════════════════  VOLATILITY  ═══════════════════════════════
 with tab_vol:
