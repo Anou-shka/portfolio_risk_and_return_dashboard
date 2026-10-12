@@ -1,73 +1,24 @@
 services:
   - type: web
     name: portfolio-pulse
-    env: python
-    plan: free             # use a paid plan so it stays running
+    runtime: python
+    plan: free
     autoDeploy: true
-    autoIdleTimeoutSeconds: 0  # Prevents auto-shutdown
 
-    buildCommand: |
-      pip install --upgrade pip
-      pip install -r requirements.txt
-
-    startCommand: |
-      bash -lc '
-        set -e
-        mkdir -p data/raw/intraday data/processed
-
-        # Seed 3y history once if missing (idempotent)
-        python -m src.data_fetch init || true
-
-        # Intraday daemon: writes data/raw/intraday/latest_data_tickers.parquet
-        python -m src.live daemon --interval 60 &
-
-        # Nightly EOD updater (run shortly after 4:00pm New York)
-        python - << "PY" &
-import time, datetime as dt
-from zoneinfo import ZoneInfo
-from src.data_fetch import update_parquet_daily
-
-def sleeps():
-    ny = ZoneInfo("America/New_York")
-    while True:
-        now = dt.datetime.now(ny)
-        target = now.replace(hour=16, minute=10, second=0, microsecond=0)
-        if now >= target:
-            target += dt.timedelta(days=1)
-        yield max(60, (target - now).total_seconds())
-
-for s in sleeps():
-    time.sleep(s)
-    try:
-        print("[scheduler] EOD:", update_parquet_daily(force=False), flush=True)
-    except Exception as e:
-        print("[scheduler] EOD error:", e, flush=True)
-    time.sleep(600)
-PY
-
-        # (Optional) Backend on internal port 8000 (FastAPI/Flask exposing app=...)
-        if [ -f app.py ]; then
-          gunicorn app:app -w 1 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 &
-        fi
-
-        # Launch Streamlit (public)
-        streamlit run app/app_2.py --server.port $PORT --server.address 0.0.0.0
-      '
-
-    # Persistent disk so all processes share /data
-    disk:
-      name: data-disk
-      mountPath: /opt/render/project/src/data
-      sizeGB: 5
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    # The app fetches all prices (daily + intraday) on demand from Yahoo Finance,
+    # so no background daemons or persistent disk are needed.
+    startCommand: bash scripts/start.sh
 
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
       - key: STREAMLIT_SERVER_HEADLESS
         value: "true"
       - key: STREAMLIT_BROWSER_GATHER_USAGE_STATS
         value: "false"
       - key: PYTHONUNBUFFERED
         value: "1"
-      - key: BACKEND_URL
-        value: "http://127.0.0.1:8000"
-
-   # - key: APP_ACCESS_CODE value: "0000"
+      # Optional password gate for the UI — set the value in the Render dashboard.
+      - key: APP_ACCESS_CODE
+        sync: false

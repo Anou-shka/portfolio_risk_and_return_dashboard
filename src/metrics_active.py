@@ -1,170 +1,106 @@
 # src/metrics_active.py
+"""Latest-session ("today") returns from daily and intraday price data.
+
+Each asset is measured against the close of the session *before its own latest
+session*. That matters because assets keep different calendars: on a Saturday
+a stock's latest session is Friday while BTC-USD's is Saturday, and on a
+weekday morning before 09:30 ET a stock's latest session is still yesterday.
+"""
 from __future__ import annotations
-from typing import Dict, List, Tuple
-from pathlib import Path
-import pandas as pd
+
+from typing import Dict, Tuple
+
 import numpy as np
+import pandas as pd
 
-from src.metrics_core import mc_var_es
+from src.metrics_core import is_crypto
 
-# paths
-from pathlib import Path
-ROOT = Path(__file__).resolve().parents[1]
-PROC = ROOT / "data" / "processed"
-RAW  = ROOT / "data" / "raw" / "intraday"
+NY_TZ = "America/New_York"
 
-# defaults/filenames (adjust if you changed them)
-_cands = sorted(PROC.glob("historical_3y_to_*_column.parquet"), key=lambda p: p.stat().st_mtime)
-PROCESSED_COLUMN = _cands[-1] if _cands else None
-INTRADAY_FILE   = RAW / "latest_data_tickers.parquet"
 
-FIELDS = ["Open","High","Low","Close","Adj Close"]
+def session_tz(symbol: str) -> str:
+    """Timezone whose calendar date defines a trading session for `symbol`.
+    Yahoo stamps crypto daily bars at 00:00 UTC; US listings use New York."""
+    return "UTC" if is_crypto(symbol) else NY_TZ
 
-def _extract_prices_adj_from_column(df: pd.DataFrame, symbols: List[str]) -> pd.DataFrame:
-    # df columns: (field, ticker)
-    px = df.xs("Adj Close", level=0, axis=1)
-    cols = [s for s in symbols if s in px.columns]
-    return px.loc[:, cols].sort_index()
 
-def load_prices_adj(symbols: List[str]) -> pd.DataFrame:
-    if PROCESSED_COLUMN is None:
-        raise FileNotFoundError("No processed parquet found. Run `python -m src.data_fetch init` first.")
-    df = pd.read_parquet(PROCESSED_COLUMN)
-    return _extract_prices_adj_from_column(df, symbols)
+def latest_daily_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """Per-symbol return of the latest daily bar vs the previous one.
 
-def latest_intraday_last(intraday_path: Path, symbols: List[str]) -> pd.Series:
+    `prices` is a raw (not calendar-aligned) daily close matrix. Returns a frame
+    indexed by symbol with columns: ret, last, prev, date, prev_date.
     """
-    Return the latest 'last price' per symbol from today’s intraday file.
-    File columns are MultiIndex: (ticker, field). We use 'Close' (or Adj Close).
-    """
-    if not intraday_path.exists():
-        return pd.Series(dtype=float)
-    df = pd.read_parquet(intraday_path)
-    if df.empty: return pd.Series(dtype=float)
-    # columns: (ticker, field)
-    if not isinstance(df.columns, pd.MultiIndex):
-        # single ticker fallback
-        sym = symbols[0]
-        last = df["Close"].ffill().iloc[-1]
-        return pd.Series({sym: float(last)})
-    out = {}
-    for s in symbols:
-        if (s, "Close") in df.columns:
-            out[s] = float(df[(s, "Close")].ffill().iloc[-1])
-        elif (s, "Adj Close") in df.columns:
-            out[s] = float(df[(s, "Adj Close")].ffill().iloc[-1])
-    return pd.Series(out, dtype=float)
-
-def prev_close_map(prices_adj: pd.DataFrame) -> Dict[str, float]:
-    last_row = prices_adj.iloc[-1]
-    return {c: float(last_row[c]) for c in prices_adj.columns}
-
-def today_returns(last: pd.Series, prev_map: Dict[str,float]) -> pd.Series:
-    ret = {}
-    for s, p in last.items():
-        pc = prev_map.get(s, np.nan)
-        if pc and not np.isnan(pc) and pc>0:
-            ret[s] = p/pc - 1.0
-        else:
-            ret[s] = np.nan
-    return pd.Series(ret, dtype=float).sort_index()
-
-def overlay_prices(prices_adj: pd.DataFrame, last: pd.Series, prev_map: Dict[str,float]) -> pd.DataFrame:
-    """
-    prices_adj (official history) + synthetic 'today' row using last/prev_close ratio.
-    """
-    if last.empty: return prices_adj
-    yday = prices_adj.iloc[-1]
-    new_vals = {}
-    for s in prices_adj.columns:
-        pc = prev_map.get(s, np.nan)
-        if s in last and pc and not np.isnan(pc) and pc>0:
-            new_vals[s] = float(yday[s]) * (float(last[s]) / pc)
-        else:
-            new_vals[s] = float(yday[s])
-    today_idx = pd.Timestamp.today().normalize()
-    out = prices_adj.copy()
-    if today_idx in out.index:
-        out.loc[today_idx, list(new_vals.keys())] = pd.Series(new_vals)
-    else:
-        out = pd.concat([out, pd.DataFrame([new_vals], index=[today_idx])]).sort_index()
-    return out
-
-def live_portfolio_metrics(
-    prices_adj: pd.DataFrame,
-    last: pd.Series,
-    weights: Dict[str,float],
-    bench_symbol: str,
-    daily_returns: pd.DataFrame,   # historical daily returns (from prices_adj)
-    rf_annual: float = 0.0,
-) -> Dict[str, object]:
-    prev_map = prev_close_map(prices_adj)
-    trets = today_returns(last, prev_map)  # per symbol
-    # today portfolio & bench
-    cols = [c for c in prices_adj.columns if c in trets.index]
-    w = pd.Series({k: weights.get(k, 0.0) for k in cols}, dtype=float)
-    if w.sum(): w = w / w.sum()
-    port_today = float((trets[cols] * w).sum())
-    bench_today = float(trets.get(bench_symbol, np.nan))
-    rel_today = port_today - bench_today if not np.isnan(bench_today) else np.nan
-
-    # drifted weights (based on today moves)
-    rel_moves = (trets[cols].fillna(0) + 1.0)
-    drifted = (w * rel_moves)
-    if drifted.sum(): drifted = drifted / drifted.sum()
-
-    # VaR nowcast (parametric on historical cov)
-    var1d, es1d = mc_var_es(daily_returns[cols], drifted, alpha=0.95, horizon_days=1, n_sims=10_000, seed=42)
-
-    return {
-        "today_returns_by_symbol": trets,
-        "portfolio_today": port_today,
-        "benchmark_today": bench_today,
-        "relative_today": rel_today,
-        "drifted_weights": drifted.sort_values(ascending=False),
-        "var_1d": var1d,
-        "es_1d": es1d,
-    }
+    rows = {}
+    for sym in prices.columns:
+        s = prices[sym].dropna()
+        if len(s) < 2 or s.iloc[-2] <= 0:
+            continue
+        rows[sym] = {
+            "ret": float(s.iloc[-1] / s.iloc[-2] - 1.0),
+            "last": float(s.iloc[-1]),
+            "prev": float(s.iloc[-2]),
+            "date": s.index[-1],
+            "prev_date": s.index[-2],
+        }
+    cols = ["ret", "last", "prev", "date", "prev_date"]
+    return pd.DataFrame.from_dict(rows, orient="index", columns=cols)
 
 
+def _to_utc_index(idx: pd.Index) -> pd.DatetimeIndex:
+    idx = pd.DatetimeIndex(idx)
+    return idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
 
-def intraday_close_matrix(intraday_path: Path, symbols: List[str]) -> pd.DataFrame:
-    """
-    Return minute-by-minute Close for the selected symbols from the intraday parquet.
-    Columns: symbols, Index: minute timestamps (tz-naive or UTC from parquet).
-    """
-    if not intraday_path.exists():
-        return pd.DataFrame(columns=symbols)
-    df = pd.read_parquet(intraday_path)
-    if df.empty:
-        return pd.DataFrame(columns=symbols)
-    # Normalize to (ticker, field)
-    if not isinstance(df.columns, pd.MultiIndex):
-        # single ticker fallback
-        return pd.DataFrame({symbols[0]: df["Close"]}, index=df.index)
 
-    out = {}
-    for s in symbols:
-        if (s, "Close") in df.columns:
-            out[s] = df[(s, "Close")].ffill()
-        elif (s, "Adj Close") in df.columns:
-            out[s] = df[(s, "Adj Close")].ffill()
-    if not out:
-        return pd.DataFrame(columns=symbols)
-    m = pd.DataFrame(out).sort_index()
-    # drop duplicated stamps just in case
-    m = m[~m.index.duplicated(keep="last")]
-    return m
+def intraday_session_returns(
+    intra_close: pd.DataFrame,
+    daily_prices: pd.DataFrame,
+) -> Tuple[pd.DataFrame, Dict[str, pd.Timestamp]]:
+    """Minute-by-minute return of each symbol's latest session vs its prior close.
 
-def intraday_return_matrix(intra_close: pd.DataFrame, prev_close: Dict[str, float]) -> pd.DataFrame:
-    """
-    Minute-by-minute return since prior official close: Close_t / prev_close - 1.
+    intra_close  : intraday close matrix (columns = symbols), any tz.
+    daily_prices : raw daily close matrix with tz-naive date index.
+
+    Returns (returns matrix on a UTC index, {symbol: session date}). Each
+    column is forward-filled, and the matrix starts once every symbol's latest
+    session has begun, so every row has a value for every symbol.
     """
     if intra_close.empty:
-        return intra_close
-    prev = pd.Series(prev_close)
-    # keep only symbols present in intra_close
-    prev = prev.reindex(intra_close.columns).astype(float)
-    # avoid division by zero
-    prev[~np.isfinite(prev) | (prev <= 0)] = np.nan
-    return intra_close.divide(prev, axis=1) - 1.0
+        return pd.DataFrame(), {}
+    intra_close = intra_close.copy()
+    intra_close.index = _to_utc_index(intra_close.index)
+
+    series: Dict[str, pd.Series] = {}
+    sessions: Dict[str, pd.Timestamp] = {}
+    for sym in intra_close.columns:
+        s = intra_close[sym].dropna()
+        if s.empty or sym not in daily_prices.columns:
+            continue
+        local_dates = s.index.tz_convert(session_tz(sym)).normalize().tz_localize(None)
+        session = local_dates[-1]
+        s = s[local_dates == session]
+        daily = daily_prices[sym].dropna()
+        prior = daily[daily.index.normalize() < session]
+        if prior.empty or prior.iloc[-1] <= 0:
+            continue
+        series[sym] = s / float(prior.iloc[-1]) - 1.0
+        sessions[sym] = session
+
+    if not series:
+        return pd.DataFrame(), {}
+    start = max(s.index[0] for s in series.values())
+    m = pd.DataFrame(series).sort_index().ffill()
+    m = m.loc[m.index >= start]
+    return m, sessions
+
+
+def weighted_return(returns: pd.DataFrame | pd.Series, weights: pd.Series) -> pd.Series | float:
+    """Weighted portfolio return using only the symbols present in `returns`,
+    renormalising the weights over them."""
+    cols = returns.index if isinstance(returns, pd.Series) else returns.columns
+    w = weights.reindex([c for c in weights.index if c in cols]).fillna(0.0)
+    if w.empty or not w.sum():
+        return np.nan if isinstance(returns, pd.Series) else pd.Series(np.nan, index=returns.index)
+    w = w / w.sum()
+    if isinstance(returns, pd.Series):
+        return float((returns.reindex(w.index) * w).sum())
+    return returns[w.index].dot(w)

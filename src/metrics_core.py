@@ -39,9 +39,31 @@ def _to_w(
 # ─────────────────────────── basic series ops ────────────────────────────────
 
 def price_to_returns(prices: pd.DataFrame, kind: str = "simple") -> pd.DataFrame:
-    prices = prices.sort_index()
-    r = np.log(prices / prices.shift(1)) if kind == "log" else prices.pct_change()
+    """Period returns. Gaps inside a series are forward-filled (0% return for a
+    missing day); leading NaNs (before an asset's first price) stay NaN."""
+    prices = prices.sort_index().ffill()
+    prev = prices.shift(1)
+    r = np.log(prices / prev) if kind == "log" else prices / prev - 1.0
     return r.dropna(how="all")
+
+
+def is_crypto(symbol: str) -> bool:
+    """True for Yahoo crypto pairs (BTC-USD, ETH-USD, …), which trade 24/7."""
+    return str(symbol).upper().endswith("-USD")
+
+
+def align_to_trading_calendar(prices: pd.DataFrame) -> pd.DataFrame:
+    """Keep only dates on which at least one non-crypto asset has a price.
+
+    Crypto trades every calendar day while stocks trade ~252 days a year.
+    Mixing both calendars turns weekends into fake 0% stock returns and breaks
+    every 252-day annualisation, so crypto is sampled on stock trading days
+    (Friday→Monday becomes one return). All-crypto inputs are left untouched.
+    """
+    non_crypto = [c for c in prices.columns if not is_crypto(c)]
+    if not non_crypto:
+        return prices
+    return prices.loc[prices[non_crypto].notna().any(axis=1)]
 
 
 def portfolio_returns(returns: pd.DataFrame, weights) -> pd.Series:
@@ -187,13 +209,19 @@ def max_drawdown(returns: pd.Series) -> DrawdownStats:
     if r.empty:
         return DrawdownStats(np.nan, None, None, None)
     nav = nav_from_returns(r)
-    peaks = nav.cummax()
+    # Peaks include the starting capital (NAV_0 = 1) so a loss on the very
+    # first day counts as drawdown.
+    peaks = nav.cummax().clip(lower=1.0)
     dd = nav / peaks - 1.0   # negative where nav is below its prior peak
-    if dd.empty:
-        return DrawdownStats(np.nan, None, None, None)
     trough = dd.idxmin()
-    peak = nav.loc[:trough].idxmax()
-    rec_candidates = nav.loc[trough:][nav.loc[trough:] >= peaks.loc[peak]].index
+    if dd.loc[trough] >= 0:
+        return DrawdownStats(0.0, None, None, None)
+    peak_level = float(peaks.loc[trough])
+    before = nav.loc[:trough]
+    at_peak = before[before >= peak_level]
+    peak = at_peak.index[-1] if not at_peak.empty else r.index[0]
+    after = nav.loc[trough:]
+    rec_candidates = after[after >= peak_level].index
     rec = rec_candidates.min() if not rec_candidates.empty else None
     return DrawdownStats(
         float(dd.min()),
@@ -270,11 +298,19 @@ def trace_efficient_frontier(
     mu_a = returns.mean() * TRADING_DAYS
     S = cov_matrix(returns, shrink=shrink) * TRADING_DAYS
     n = len(returns.columns)
-    grid = np.linspace(mu_a.min(), mu_a.max(), n_points)
     out = []
 
     def var_w(w):
         return float(w @ S.values @ w)
+
+    # Start the grid at the minimum-variance portfolio: targets below its
+    # return lie on the inefficient lower branch of the hyperbola.
+    sum_to_one = [{"type": "eq", "fun": lambda w: np.sum(w) - 1}]
+    mv = minimize(var_w, x0=np.repeat(1 / n, n), method="SLSQP",
+                  bounds=[bounds] * n, constraints=sum_to_one)
+    lo = float(mv.x @ mu_a.values) if mv.success else float(mu_a.min())
+    hi = float(mu_a.max())
+    grid = np.linspace(lo, hi, n_points) if hi > lo else np.array([lo])
 
     for t in grid:
         cons = [

@@ -5,7 +5,9 @@ import logging
 import os
 import re
 import sys
+import time
 import datetime as dt
+import hmac
 from pathlib import Path
 from typing import Dict, List
 from zoneinfo import ZoneInfo
@@ -36,24 +38,20 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from src.config import DEFAULT_BENCH, RF_ANN_PCT
+from src.config import DEFAULT_BENCH
 from src.metrics_core import (
-    ann_return, ann_vol, beta_alpha, calmar, cov_matrix, hist_var_cvar,
-    information_ratio, max_drawdown, mc_var_es, nav_from_returns,
-    optimize_max_sharpe, optimize_min_variance, portfolio_returns,
-    price_to_returns, relative_return_series, risk_contributions, sharpe,
-    sortino, tracking_error, trace_efficient_frontier, treynor,
-    validate_all_metrics, TRADING_DAYS,
+    align_to_trading_calendar, ann_return, ann_vol, beta_alpha, calmar,
+    cov_matrix, hist_var_cvar, information_ratio, max_drawdown, mc_var_es,
+    nav_from_returns, optimize_max_sharpe, optimize_min_variance,
+    portfolio_returns, price_to_returns, relative_return_series,
+    risk_contributions, sharpe, sortino, tracking_error,
+    trace_efficient_frontier, treynor, validate_all_metrics, TRADING_DAYS,
 )
 from src.metrics_active import (
-    intraday_close_matrix, intraday_return_matrix, latest_intraday_last,
-    overlay_prices,
+    intraday_session_returns, latest_daily_returns, weighted_return,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-
-# ── paths ─────────────────────────────────────────────────────────────────
-INTRADIR = Path(ROOT) / "data" / "raw" / "intraday"
 
 # ── plotly theme ──────────────────────────────────────────────────────────
 pio.templates.default = "plotly_dark"
@@ -248,40 +246,84 @@ def fetch_treasury_rate() -> float:
     return 0.045
 
 
-@st.cache_data(ttl=300, show_spinner="Fetching price history…")
-def fetch_history(syms: tuple[str, ...]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Download 3 years of daily adjusted close, always ending today. Cached 5 min."""
-    end   = _today() + dt.timedelta(days=1)           # yfinance end is exclusive
-    start = _today() - dt.timedelta(days=365 * 3 + 5) # +5 for weekend buffer
-    df = yf.download(
-        list(syms),
-        start=start.isoformat(),
-        end=end.isoformat(),
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-    )
-    if df.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
+def _close_matrix(df: pd.DataFrame, syms: tuple[str, ...]) -> pd.DataFrame:
+    """Extract a (date × symbol) close matrix from any yf.download layout."""
+    if df is None or df.empty:
+        return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
         lvl0 = df.columns.get_level_values(0).unique()
-        price_col = "Close" if "Close" in lvl0 else lvl0[0]
-        prices = df[price_col].copy()
+        if "Close" in lvl0:
+            prices = df["Close"]
+        else:  # group_by="ticker" layout: (ticker, field)
+            prices = df.xs("Close", axis=1, level=1)
     else:
-        col = "Close" if "Close" in df.columns else df.columns[0]
-        raw = df[col]
+        raw = df["Close"] if "Close" in df.columns else df.iloc[:, 0]
         prices = raw.to_frame(name=syms[0]) if isinstance(raw, pd.Series) else raw
+    if isinstance(prices, pd.Series):
+        prices = prices.to_frame(name=syms[0])
+    prices = prices.apply(pd.to_numeric, errors="coerce")
+    return prices.sort_index().dropna(how="all")
 
-    prices = prices.sort_index().dropna(how="all")
+
+def _yf_download(syms: tuple[str, ...], attempts: int = 2, **kw) -> pd.DataFrame:
+    """yf.download with one retry — Yahoo intermittently returns empty frames
+    to cloud hosts such as Render."""
+    for i in range(attempts):
+        try:
+            df = yf.download(list(syms), progress=False, threads=True,
+                             auto_adjust=True, **kw)
+            prices = _close_matrix(df, syms)
+            if not prices.empty:
+                return prices
+        except Exception as exc:
+            logging.warning("yf.download attempt %d failed: %s", i + 1, exc)
+        if i + 1 < attempts:
+            time.sleep(1.5)
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=300, show_spinner="Fetching price history…")
+def fetch_history(syms: tuple[str, ...]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """3 years of daily adjusted closes ending today. Cached 5 min.
+
+    Returns (raw_prices, prices, returns):
+      raw_prices — every calendar row Yahoo returned (crypto has weekends);
+                   used for "latest session" returns.
+      prices     — aligned to stock trading days, so 252-day annualisation
+                   holds; used for all historical analytics.
+      returns    — daily simple returns of `prices`.
+    """
+    end   = _today() + dt.timedelta(days=2)           # end is exclusive; +2 covers UTC-dated crypto bars
+    start = _today() - dt.timedelta(days=365 * 3 + 5) # +5 for weekend buffer
+    raw = _yf_download(syms, start=start.isoformat(), end=end.isoformat())
+    if raw.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    idx = pd.DatetimeIndex(raw.index)
+    raw.index = (idx.tz_localize(None) if idx.tz is not None else idx).normalize()
+    raw = raw[~raw.index.duplicated(keep="last")]
+
+    prices = align_to_trading_calendar(raw)
     rets   = price_to_returns(prices)
     logging.info(
         "fetch_history: %d ticker(s) | %s → %s",
         len(syms),
-        prices.index[0].date(),
-        prices.index[-1].date(),
+        raw.index[0].date(),
+        raw.index[-1].date(),
     )
-    return prices, rets
+    return raw, prices, rets
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_intraday(syms: tuple[str, ...]) -> pd.DataFrame:
+    """1-minute closes for the last few days (UTC index). Cached 60 s.
+    Five days guarantees the latest session of every asset is included,
+    even on Mondays and after holidays."""
+    m = _yf_download(syms, period="5d", interval="1m")
+    if m.empty:
+        return m
+    idx = pd.DatetimeIndex(m.index)
+    m.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+    return m[~m.index.duplicated(keep="last")]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -317,18 +359,6 @@ def validate_and_get_info(symbol: str) -> tuple[bool, dict]:
         return True, meta
     except Exception:
         return False, {}
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def load_intraday_cached(_path: str, symbols: tuple[str, ...]):
-    p = Path(_path)
-    last      = latest_intraday_last(p, list(symbols))
-    close_m   = intraday_close_matrix(p, list(symbols))
-    return last, close_m
-
-
-def intraday_file_path() -> Path:
-    return INTRADIR / "latest_data_tickers.parquet"
 
 
 def normalize_ex_bench(d: Dict[str, float], bench: str) -> pd.Series:
@@ -380,6 +410,18 @@ st.set_page_config(
 )
 inject_css()
 
+# ── Optional access gate (set APP_ACCESS_CODE to enable) ──────────────────
+_ACCESS_CODE = os.environ.get("APP_ACCESS_CODE", "").strip()
+if _ACCESS_CODE and not st.session_state.get("access_ok"):
+    st.markdown('<div class="pp-title">📈 Portfolio Pulse</div>', unsafe_allow_html=True)
+    _code = st.text_input("Access code", type="password", key="access_code_input")
+    if _code:
+        if hmac.compare_digest(_code.strip(), _ACCESS_CODE):
+            st.session_state.access_ok = True
+            st.rerun()
+        st.error("Incorrect access code.")
+    st.stop()
+
 # ══════════════════════════════════════════════════════════════════════════
 #  SESSION STATE
 # ══════════════════════════════════════════════════════════════════════════
@@ -390,9 +432,40 @@ if "portfolio_tickers" not in st.session_state:
 if "ticker_meta" not in st.session_state:
     st.session_state.ticker_meta = {}
 if "last_add_status" not in st.session_state:
-    st.session_state.last_add_status = None   # ("ok"|"err", msg)
+    st.session_state.last_add_status = None   # ("ok"|"warn"|"err", msg)
 if "metrics_validated" not in st.session_state:
     st.session_state.metrics_validated = False
+
+
+def _add_ticker() -> None:
+    """Button callback: validate and add the typed / selected ticker, then
+    clear the inputs (widget state may only be reset inside a callback)."""
+    custom = st.session_state.get("custom_ticker_input", "").strip().upper()
+    pick = st.session_state.get("catalog_selectbox", _CATALOG_PLACEHOLDER)
+    sym = custom or (extract_ticker(pick) if pick != _CATALOG_PLACEHOLDER else "")
+    if not sym:
+        st.session_state.last_add_status = ("warn", "Select a ticker from the catalog or type one above.")
+        return
+    if sym in st.session_state.portfolio_tickers:
+        st.session_state.last_add_status = ("warn", f"{sym} is already in your portfolio.")
+        return
+    valid, meta = validate_and_get_info(sym)
+    if not valid:
+        st.session_state.last_add_status = ("err", f"❌ '{sym}' not found on Yahoo Finance.")
+        return
+    st.session_state.portfolio_tickers.append(sym)
+    st.session_state.ticker_meta[sym] = meta
+    st.session_state.custom_ticker_input = ""
+    st.session_state.catalog_selectbox = _CATALOG_PLACEHOLDER
+    st.session_state.last_add_status = ("ok", f"✅ {meta.get('name', sym)} ({sym}) added!")
+
+
+def _sync_rf(src: str, dst: str) -> None:
+    """Keep the risk-free slider and number box showing the same value."""
+    v = float(st.session_state[src])
+    if dst == "rf_slider":
+        v = min(max(v, 0.0), 10.0)
+    st.session_state[dst] = v
 
 # ══════════════════════════════════════════════════════════════════════════
 #  PAGE HEADER
@@ -406,8 +479,6 @@ st.markdown(f"""
 # ══════════════════════════════════════════════════════════════════════════
 #  SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════
-INTRA = intraday_file_path()
-
 with st.sidebar:
     st.markdown("## 📈 Portfolio Pulse")
     st.caption(f"Today: {_today():%B %d, %Y}")
@@ -430,44 +501,19 @@ with st.sidebar:
             help="Enter any valid Yahoo Finance symbol.",
         )
 
-        add_clicked = st.button(
+        st.button(
             "＋ Add to Portfolio",
-            use_container_width=True,
+            width="stretch",
             type="primary",
             key="btn_add_ticker",
+            on_click=_add_ticker,
+            help="A typed ticker takes priority over the catalog selection.",
         )
 
-        # Determine what to add (custom takes priority if filled)
-        ticker_to_add: str | None = None
-        if custom_input.strip():
-            ticker_to_add = custom_input.strip().upper()
-        elif selected_catalog != _CATALOG_PLACEHOLDER:
-            ticker_to_add = extract_ticker(selected_catalog)
-
-        if add_clicked:
-            if not ticker_to_add:
-                st.warning("Select a ticker from the catalog or type one above.")
-            elif ticker_to_add in st.session_state.portfolio_tickers:
-                st.warning(f"{ticker_to_add} is already in your portfolio.")
-            else:
-                with st.spinner(f"Validating {ticker_to_add}…"):
-                    valid, meta = validate_and_get_info(ticker_to_add)
-                if valid:
-                    st.session_state.portfolio_tickers.append(ticker_to_add)
-                    st.session_state.ticker_meta[ticker_to_add] = meta
-                    name = meta.get("name", ticker_to_add)
-                    st.session_state.last_add_status = ("ok", f"✅ {name} ({ticker_to_add}) added!")
-                    st.rerun()
-                else:
-                    st.error(f"❌ '{ticker_to_add}' not found on Yahoo Finance.")
-
-        # Show result from previous rerun
+        # Show result of the last add attempt
         if st.session_state.last_add_status:
             kind, msg = st.session_state.last_add_status
-            if kind == "ok":
-                st.success(msg)
-            else:
-                st.error(msg)
+            {"ok": st.success, "warn": st.warning}.get(kind, st.error)(msg)
             st.session_state.last_add_status = None
 
         # Current portfolio chips
@@ -538,8 +584,10 @@ with st.sidebar:
         sliders: Dict[str, float] = {}
         if weight_mode == "Custom Weights":
             st.caption("Set weights (renormalized to 100%):")
-            for c in [s for s in chosen if s != bench]:
-                sliders[c] = st.slider(c, 0.0, 1.0, 0.0, 0.01, key=f"w_{c}")
+            _w_assets = [s for s in chosen if s != bench]
+            _w_default = round(1.0 / len(_w_assets), 2) if _w_assets else 0.0
+            for c in _w_assets:
+                sliders[c] = st.slider(c, 0.0, 1.0, _w_default, 0.01, key=f"w_{c}")
 
         st.divider()
 
@@ -547,58 +595,61 @@ with st.sidebar:
         st.markdown("**🏦 Risk-Free Rate**", help="Annual risk-free rate used in all ratio calculations.")
         live_rf = fetch_treasury_rate()
         st.caption(f"🏦 Current 10Y Treasury: **{live_rf * 100:.2f}%**")
-        rf_slider = st.slider(
+        if "rf_slider" not in st.session_state:
+            _rf0 = round(min(max(live_rf * 100, 0.0), 10.0), 2)
+            st.session_state.rf_slider = _rf0
+            st.session_state.rf_number_input = _rf0
+        st.slider(
             "Annual RF rate (%)",
             min_value=0.0,
             max_value=10.0,
-            value=float(live_rf * 100),
             step=0.05,
             format="%.2f%%",
+            key="rf_slider",
+            on_change=_sync_rf, args=("rf_slider", "rf_number_input"),
             help=(
                 "The risk-free rate is the return of a risk-free investment (typically "
                 "the 10-year US Treasury). It is subtracted from portfolio returns when "
                 "computing risk-adjusted metrics like Sharpe and Sortino."
             ),
         )
-        rf_num = st.number_input(
+        st.number_input(
             "Or enter precise value (%)",
             min_value=0.0,
             max_value=20.0,
-            value=float(rf_slider),
             step=0.01,
             format="%.2f",
             key="rf_number_input",
+            on_change=_sync_rf, args=("rf_number_input", "rf_slider"),
         )
-        rf = float(rf_num) / 100.0   # decimal form for all calculations
+        rf = float(st.session_state.rf_number_input) / 100.0   # decimal form for all calculations
 
     # ── 🔄 Data ───────────────────────────────────────────────────────────
     with st.expander("🔄 Data", expanded=False):
-        st.caption("Price data is auto-refreshed every 5 minutes from Yahoo Finance.")
-        st.caption(f"Session started: {_now():%Y-%m-%d %H:%M:%S}")
-        if st.button("🔄 Refresh Data Now", use_container_width=True, key="btn_refresh"):
+        st.caption("Daily prices are cached for 5 minutes, intraday prices for 1 minute.")
+        data_status = st.empty()   # filled once prices are loaded
+        if st.button("🔄 Refresh Data Now", width="stretch", key="btn_refresh"):
             st.cache_data.clear()
             st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════
 #  LOAD & SLICE DATA
 # ══════════════════════════════════════════════════════════════════════════
-prices_all, rets_all = fetch_history(tuple(ALL_SYMS))
+raw_all, prices_all, rets_all = fetch_history(tuple(ALL_SYMS))
 
 if prices_all.empty:
-    missing = [s for s in ALL_SYMS if s not in (prices_all.columns if not prices_all.empty else [])]
     st.error(
-        "No price data could be loaded. "
-        "Check symbols and your network connection. "
+        "No price data could be loaded from Yahoo Finance (it may be rate-limiting "
+        "this server — try **🔄 Refresh Data Now** in a minute). "
         f"Symbols attempted: {', '.join(ALL_SYMS)}"
     )
     st.stop()
 
 # Show last updated in sidebar Data section
-with st.sidebar:
-    with st.expander("🔄 Data", expanded=False):
-        last_date = prices_all.index[-1].date()
-        st.success(f"**Last updated:** {_now():%H:%M:%S}")
-        st.caption(f"Most recent bar: **{last_date}**")
+data_status.markdown(
+    f"✅ **Loaded:** {_now():%H:%M:%S} ET  \n"
+    f"Most recent daily bar: **{raw_all.index[-1].date()}**"
+)
 
 # Auto-populate metadata for any portfolio ticker missing it
 for sym in list(st.session_state.portfolio_tickers):
@@ -610,44 +661,72 @@ VIEW_SYMS = list(dict.fromkeys(chosen + [bench]))
 prices = prices_all.loc[:, [c for c in VIEW_SYMS if c in prices_all.columns]]
 rets   = rets_all.loc[:,   [c for c in VIEW_SYMS if c in rets_all.columns]]
 
-# Error if any chosen ticker returned no data
-for sym in chosen:
-    if sym not in prices.columns or prices[sym].dropna().empty:
-        st.error(f"⚠️ No data returned for **{sym}**. It may be delisted or invalid.")
+# Error if any chosen ticker returned no data; drop it from the analysis
+_no_data = [s for s in VIEW_SYMS if s not in prices.columns or prices[s].dropna().empty]
+for sym in _no_data:
+    st.error(f"⚠️ No data returned for **{sym}**. It may be delisted or invalid.")
+if bench in _no_data:
+    st.error(f"Benchmark **{bench}** has no data — pick another benchmark.")
+    st.stop()
+chosen    = [s for s in chosen if s not in _no_data]
+VIEW_SYMS = [s for s in VIEW_SYMS if s not in _no_data]
+prices    = prices.loc[:, VIEW_SYMS]
+rets      = rets.loc[:, VIEW_SYMS]
+if not [s for s in chosen if s != bench]:
+    st.warning("Select at least one asset (other than the benchmark) with price data.")
+    st.stop()
 
 today_ts = prices.index.max()
 
 
-def cutoff_ts(choice: str):
-    if choice == "Today": return today_ts, True
-    if choice == "1W":    return today_ts - pd.Timedelta(days=7), False
-    if choice == "1M":    return today_ts - pd.Timedelta(days=30), False
-    if choice == "6M":    return today_ts - pd.Timedelta(days=182), False
-    if choice == "1Y":    return today_ts - pd.Timedelta(days=365), False
-    if choice == "3Y":    return today_ts - pd.Timedelta(days=365 * 3), False
+def window_bounds(choice: str):
+    """(start, end, is_today) of the analysis window, as timestamps."""
+    if choice == "Today": return today_ts, today_ts, True
+    if choice == "1W":    return today_ts - pd.Timedelta(days=7), today_ts, False
+    if choice == "1M":    return today_ts - pd.DateOffset(months=1), today_ts, False
+    if choice == "6M":    return today_ts - pd.DateOffset(months=6), today_ts, False
+    if choice == "1Y":    return today_ts - pd.DateOffset(years=1), today_ts, False
+    if choice == "3Y":    return today_ts - pd.DateOffset(years=3), today_ts, False
     if custom_dates and len(custom_dates) == 2:
-        return pd.Timestamp(custom_dates[0]), False
-    return prices.index.min(), False
+        a, b = sorted(pd.Timestamp(d) for d in custom_dates)
+        return a, b, False
+    st.sidebar.caption("Pick both a start and an end date — showing the full history meanwhile.")
+    return prices.index.min(), today_ts, False
 
 
-cut, is_today = cutoff_ts(range_choice)
-hist_px = prices.loc[prices.index >= cut]
-hist_rt = rets.loc[rets.index >= cut]
+cut, end_ts, is_today = window_bounds(range_choice)
+hist_px = prices.loc[(prices.index >= cut) & (prices.index <= end_ts)]
+hist_rt = rets.loc[(rets.index >= cut) & (rets.index <= end_ts)]
+if not is_today and len(hist_rt) < 2:
+    st.warning("The selected window has fewer than 2 trading days of returns — pick a wider window.")
+    st.stop()
 
 # ── Build weights ──────────────────────────────────────────────────────────
+_equal_w = normalize_ex_bench({s: 0.0 if s == bench else 1.0 for s in chosen}, bench)
 if weight_mode == "Equal-weighted (excl. benchmark)":
-    w = normalize_ex_bench({s: 0.0 if s == bench else 1.0 for s in chosen}, bench)
+    w = _equal_w
 elif weight_mode == "Custom Weights":
-    w = normalize_ex_bench(sliders, bench)
+    w = normalize_ex_bench({k: v for k, v in sliders.items() if k in chosen}, bench)
+    if not w.sum():
+        st.warning("All custom weights are 0 — using equal weights instead.")
+        w = _equal_w
 else:
-    cols_opt = [c for c in hist_rt.columns if c in chosen and c != bench]
-    R_opt    = hist_rt[cols_opt]
-    if weight_mode == "Max Sharpe":
-        wopt = optimize_max_sharpe(R_opt, rf_annual=rf) if len(cols_opt) >= 2 else pd.Series(np.nan, index=cols_opt)
+    # "Today" has a single return row, too little to optimise on: use full history.
+    _opt_rt = rets if is_today else hist_rt
+    cols_opt = [c for c in _opt_rt.columns if c in chosen and c != bench]
+    R_opt    = _opt_rt[cols_opt]
+    if len(cols_opt) < 2:
+        wopt = pd.Series(np.nan, index=cols_opt)
+    elif weight_mode == "Max Sharpe":
+        wopt = optimize_max_sharpe(R_opt, rf_annual=rf)
     else:
-        wopt = optimize_min_variance(R_opt) if len(cols_opt) >= 2 else pd.Series(np.nan, index=cols_opt)
-    wopt = wopt.dropna()
-    w = wopt if wopt.sum() else normalize_ex_bench({s: 0.0 if s == bench else 1.0 for s in chosen}, bench)
+        wopt = optimize_min_variance(R_opt)
+    wopt = wopt.dropna().clip(lower=0.0)
+    if wopt.sum() > 0:
+        w = wopt / wopt.sum()
+    else:
+        st.warning(f"{weight_mode} optimisation needs ≥ 2 assets with enough history — using equal weights.")
+        w = _equal_w
 
 # ── Summary pills ─────────────────────────────────────────────────────────
 asset_ct = len([s for s in chosen if s != bench])
@@ -657,7 +736,7 @@ st.markdown(
       <span class='pp-pill'>Assets: <b>{asset_ct}</b></span>
       <span class='pp-pill'>Benchmark: <b>{bench}</b></span>
       <span class='pp-pill'>Weights: <b>{weight_mode.split(" (")[0]}</b></span>
-      <span class='pp-pill'>Window: <b>{'Today' if is_today else str(cut.date())} → {today_ts.date()}</b></span>
+      <span class='pp-pill'>Window: <b>{'Latest session' if is_today else f"{hist_rt.index.min().date()} → {hist_rt.index.max().date()}"}</b></span>
       <span class='pp-pill'>RF: <b>{rf*100:.2f}%</b></span>
     </div>
     """,
@@ -665,20 +744,91 @@ st.markdown(
 )
 
 # ── Portfolio & benchmark return series ──────────────────────────────────
-port    = portfolio_returns(hist_rt.drop(columns=[bench], errors="ignore"), w)
-bench_s = hist_rt.get(bench)
+port    = portfolio_returns(hist_rt[[c for c in w.index if c in hist_rt.columns]], w)
+bench_s = hist_rt[bench]
 
-# ── Startup metrics validation (once per session) ─────────────────────────
-if not st.session_state.metrics_validated:
+# ── Optional metrics self-check (set PP_VALIDATE_METRICS=1); logs only ────
+if os.environ.get("PP_VALIDATE_METRICS") == "1" and not st.session_state.metrics_validated:
     st.session_state.metrics_validated = True
     try:
-        val_prices, val_rets = fetch_history(("SPY", "QQQ"))
+        _, _, val_rets = fetch_history(("SPY", "QQQ"))
         if not val_rets.empty and "SPY" in val_rets.columns and "QQQ" in val_rets.columns:
             spy_r = val_rets["SPY"].dropna()
             qqq_r = val_rets["QQQ"].dropna()
             validate_all_metrics(spy_r, qqq_r, rf_annual=0.045, label="SPY_vs_QQQ")
     except Exception as exc:
         logging.warning("Startup validation skipped: %s", exc)
+
+def _color(v: float) -> str:
+    if not np.isfinite(v):
+        return "var(--muted)"
+    return "var(--good)" if v >= 0 else "var(--bad)"
+
+
+def _fmt_ret(v: float) -> str:
+    return f"{v:+.2%}" if np.isfinite(v) else "N/A"
+
+
+def render_summary_cards(port_ret: float, bench_ret: float, note: str = "") -> None:
+    """Portfolio / benchmark / active-return cards for the latest session."""
+    active = port_ret - bench_ret if np.isfinite(port_ret) and np.isfinite(bench_ret) else np.nan
+    for col, label, val in zip(
+        st.columns(3),
+        ["Portfolio", bench, "Active (Portfolio − Bench)"],
+        [port_ret, bench_ret, active],
+    ):
+        col.markdown(
+            f"""<div class="metric-card">
+              <div class="metric-title">{label}</div>
+              <div class="metric-value" style="color:{_color(val)}">{_fmt_ret(val)}</div>
+              <div class="metric-note">{note}</div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+
+def render_latest_daily(daily: pd.DataFrame, syms: List[str], title: str) -> None:
+    """Latest-session return of each asset from daily bars + portfolio summary."""
+    daily = daily.reindex([s for s in syms if s in daily.index]).dropna(subset=["ret"])
+    if daily.empty:
+        st.info("Not enough daily price data to compute the latest session return.")
+        return
+    st.markdown(f'<div class="section-title">{title}</div>', unsafe_allow_html=True)
+    port_ret  = weighted_return(daily["ret"], w)
+    bench_ret = float(daily.loc[bench, "ret"]) if bench in daily.index else np.nan
+    render_summary_cards(port_ret, bench_ret, note="latest session vs prior close")
+
+    assets = list(daily.index)
+    for start in range(0, len(assets), 4):
+        row = st.columns(4)
+        for col, sym in zip(row, assets[start:start + 4]):
+            r = daily.loc[sym]
+            col.markdown(
+                f"""<div class="metric-card">
+                  <div class="metric-title">{sym}</div>
+                  <div class="metric-value" style="color:{_color(r['ret'])}">{_fmt_ret(r['ret'])}</div>
+                  <div class="metric-note">{r['last']:,.2f} · {r['date']:%a %b %d} vs {r['prev_date']:%b %d}</div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+
+    bar = daily["ret"].sort_values()
+    fig = go.Figure(go.Bar(
+        x=bar.index, y=bar.values,
+        marker_color=["#22c55e" if v >= 0 else "#ef4444" for v in bar.values],
+        hovertemplate="%{x}: %{y:+.2%}<extra></extra>",
+    ))
+    fig.update_yaxes(tickformat=".1%")
+    nice_fig(fig, title="Latest Session Return by Asset", xlab="Ticker", ylab="Return")
+    st.plotly_chart(fig, width="stretch")
+    if daily["date"].nunique() > 1:
+        st.caption(
+            "Assets are on different calendars (crypto trades 24/7), so each one "
+            "shows its own latest session — see the dates on each card."
+        )
+
+
+latest_daily = latest_daily_returns(raw_all.loc[:, VIEW_SYMS])
 
 # ══════════════════════════════════════════════════════════════════════════
 #  TABS
@@ -690,64 +840,8 @@ tab_perf, tab_live, tab_vol, tab_risk, tab_div = st.tabs(
 # ════════════════════════════  PERFORMANCE  ══════════════════════════════
 with tab_perf:
     if is_today:
-        # Show today's single-day return from the daily price history
-        _prior_idx = (
-            -2 if prices.index[-1].date() == _today() and len(prices) > 1
-            else -1
-        )
-        _today_row = prices.iloc[-1]
-        _prev_row  = prices.iloc[_prior_idx]
-        _today_rets = (_today_row / _prev_row - 1.0).dropna()
-
-        st.markdown('<div class="section-title">Today\'s Return (vs Prior Close)</div>', unsafe_allow_html=True)
-        _cols = [s for s in VIEW_SYMS if s in _today_rets.index]
-        if _cols:
-            _n = min(len(_cols), 4)
-            _tcols = st.columns(_n)
-            for i, sym in enumerate(_cols[:_n]):
-                v = float(_today_rets[sym])
-                color = "var(--good)" if v >= 0 else "var(--bad)"
-                _tcols[i].markdown(
-                    f"""<div class="metric-card">
-                      <div class="metric-title">{sym}</div>
-                      <div class="metric-value" style="color:{color}">{v:+.2%}</div>
-                      <div class="metric-note">vs prior close</div>
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
-            if len(_cols) > 4:
-                _extra = st.columns(min(len(_cols) - 4, 4))
-                for i, sym in enumerate(_cols[4:8]):
-                    v = float(_today_rets[sym])
-                    color = "var(--good)" if v >= 0 else "var(--bad)"
-                    _extra[i].markdown(
-                        f"""<div class="metric-card">
-                          <div class="metric-title">{sym}</div>
-                          <div class="metric-value" style="color:{color}">{v:+.2%}</div>
-                          <div class="metric-note">vs prior close</div>
-                        </div>""",
-                        unsafe_allow_html=True,
-                    )
-
-        # Portfolio today
-        w_today = w.reindex([s for s in _cols if s != bench]).fillna(0.0)
-        if w_today.sum():
-            w_today = w_today / w_today.sum()
-        _port_ret = float((_today_rets.reindex(w_today.index).fillna(0.0) * w_today).sum())
-        _bench_ret = float(_today_rets.get(bench, np.nan)) if bench in _today_rets else np.nan
-
-        st.divider()
-        _pc1, _pc2, _pc3 = st.columns(3)
-        _pc1.metric("Portfolio Today", f"{_port_ret:+.2%}",
-                    help="Weighted daily return of your portfolio vs prior close.")
-        if np.isfinite(_bench_ret):
-            _pc2.metric(f"{bench} Today", f"{_bench_ret:+.2%}")
-            _pc3.metric("Active Return Today", f"{(_port_ret - _bench_ret):+.2%}",
-                        help="Portfolio return minus benchmark return today.")
-        st.caption(
-            f"Prices as of {_today_row.name.date()} · "
-            "Switch to 1W / 1M / … for full historical metrics."
-        )
+        render_latest_daily(latest_daily, VIEW_SYMS, "Latest Session Return (vs Prior Close)")
+        st.caption("Switch to 1W / 1M / … for full historical metrics.")
     else:
         with st.spinner("Computing metrics…"):
             p_ret  = ann_return(port)
@@ -819,7 +913,7 @@ with tab_perf:
             labels={"value": "NAV (rebased to 1)", "variable": "Series"},
         )
         nice_fig(fig_nav, title="Cumulative Net Asset Value", xlab="Date", ylab="NAV")
-        st.plotly_chart(fig_nav, use_container_width=True)
+        st.plotly_chart(fig_nav, width="stretch")
         st.toggle(
             "Show individual assets in NAV chart",
             key="nav_assets_toggle",
@@ -834,181 +928,71 @@ with tab_perf:
                 color_discrete_sequence=["#f5b731"],
             )
             nice_fig(fig_rel, title=f"Cumulative Outperformance vs {bench}", xlab="Date", ylab="Relative Return")
-            st.plotly_chart(fig_rel, use_container_width=True)
+            st.plotly_chart(fig_rel, width="stretch")
 
 # ════════════════════════════  LIVE  ══════════════════════════════════════
 with tab_live:
     st.subheader("Live Intraday View")
     win_opt = st.select_slider(
         "Show last…",
-        options=["30m", "1h", "2h", "3h", "6h", "Full day"],
-        value="3h",
-        help="Slice the intraday cache to the recent window.",
+        options=["30m", "1h", "2h", "3h", "6h", "Full session"],
+        value="Full session",
+        help="Slice the intraday chart to the most recent window.",
     )
     _mins = {"30m": 30, "1h": 60, "2h": 120, "3h": 180, "6h": 360}
 
-    _intra_file_usable = False   # set to True only when file exists and is fresh today
+    intra_close = fetch_intraday(tuple(VIEW_SYMS))
+    rets_min, sessions = intraday_session_returns(intra_close, raw_all)
 
-    if (INTRA := intraday_file_path()).exists():
-        # Load first so we can check the actual data dates — git sets mtime to
-        # checkout time on every deploy, so file mtime is always "today" and
-        # cannot be trusted as a freshness signal.
-        last, intra_close = load_intraday_cached(str(INTRA), tuple(ALL_SYMS))
-
-        if not intra_close.empty:
-            # Determine the NY-local date of the newest data row
-            _last_ts = intra_close.index.max()
-            if getattr(_last_ts, "tz", None) is None:
-                _last_ts = pd.Timestamp(_last_ts).tz_localize("UTC")
-            _cache_date = _last_ts.tz_convert(_NY).date()
-            _cache_is_stale = _cache_date < _today()
-        else:
-            _cache_date = None
-            _cache_is_stale = True
-
-        if _cache_is_stale:
-            _stale_label = str(_cache_date) if _cache_date else "an unknown date"
-            st.warning(
-                f"⚠️ Intraday cache contains data from **{_stale_label}** — it is stale "
-                "and has been ignored. The daemon writes fresh data during NYSE hours "
-                "(09:30–16:00 ET). Showing today's return from daily price data instead."
-            )
-            _intra_file_usable = False
-        else:
-            _intra_file_usable = True
-
-        if _intra_file_usable:
-            if not intra_close.empty:
-                if win_opt != "Full day":
-                    start_ts = intra_close.index.max() - pd.Timedelta(minutes=_mins[win_opt])
-                    intra_close = intra_close.loc[intra_close.index >= start_ts]
-
-                # Prior close reference: if today's daily bar is already in the
-                # history we must step back one row to get yesterday's close.
-                _prior_idx = (
-                    -2 if prices_all.index[-1].date() == _today() and len(prices_all) > 1
-                    else -1
-                )
-                prev_map = {
-                    c: float(prices_all.iloc[_prior_idx][c])
-                    for c in prices_all.columns
-                }
-                cols = [s for s in VIEW_SYMS if s in intra_close.columns]
-                if cols:
-                    rets_min = intraday_return_matrix(intra_close.loc[:, cols], prev_map)
-                    if not rets_min.empty:
-                        w_cols = w.reindex([c for c in cols if c != bench]).fillna(0.0)
-                        if w_cols.sum():
-                            w_cols = w_cols / w_cols.sum()
-                        port_today  = rets_min[w_cols.index].dot(w_cols).rename("Portfolio (today)")
-                        bench_today = rets_min.get(bench)
-                        chart_df    = pd.concat([port_today, bench_today], axis=1).dropna(how="all")
-                        npts        = len(chart_df)
-
-                        fig_live = px.line(
-                            chart_df,
-                            labels={"value": "Intraday Return", "variable": "Series"},
-                        )
-                        nice_fig(fig_live, title=f"Intraday Return vs Prior Close — {npts:,} pts",
-                                 xlab="Time", ylab="Return")
-                        st.plotly_chart(fig_live, use_container_width=True)
-
-                        if npts:
-                            p_now = float(port_today.dropna().iloc[-1]) if len(port_today.dropna()) else float("nan")
-                            b_now = (float(bench_today.dropna().iloc[-1])
-                                     if bench_today is not None and len(bench_today.dropna()) else float("nan"))
-                            t1, t2, t3 = st.columns(3)
-                            for label, val, col in [
-                                ("Today (Portfolio)", p_now, t1),
-                                (f"Today ({bench})", b_now, t2),
-                                ("Today Relative", p_now - b_now if np.isfinite(b_now) else np.nan, t3),
-                            ]:
-                                col.markdown(
-                                    f"""<div class="metric-card">
-                                      <div class="metric-title">{label}</div>
-                                      <div class="metric-value">{val:.2%}</div>
-                                    </div>""",
-                                    unsafe_allow_html=True,
-                                )
-
-                        show_ov = st.toggle("Show 7-day overlay (Adj Close)", value=False)
-                        if show_ov and not last.empty:
-                            ov     = overlay_prices(prices_all, last, prev_map)
-                            fig_ov = px.line(ov.loc[ov.index >= ov.index.max() - pd.Timedelta(days=7)],
-                                             labels={"value": "Price", "variable": "Ticker"})
-                            nice_fig(fig_ov, title="Overlay Adj Close — last 7 days", xlab="Date", ylab="Price")
-                            st.plotly_chart(fig_ov, use_container_width=True)
-
-                st.caption(f"Data date: {_cache_date} ET · rows: {len(intra_close):,}")
-            else:
-                st.info("Intraday cache exists but is empty for selected symbols.")
-        else:
-            _intra_file_usable = False  # stale — warned above; fall through to daily fallback
-
-    # ── Daily-data fallback (no file, or stale file) ──────────────────────
-    _intra_missing = not intraday_file_path().exists()
-    _show_daily_fallback = _intra_missing or not _intra_file_usable
-    if _intra_missing:
+    if rets_min.empty:
         st.info(
-            "No intraday cache found. Run `python -m src.live daemon` during market hours "
-            "to enable live 1-minute updates."
+            "Intraday (1-minute) data is unavailable right now — Yahoo may be "
+            "rate-limiting this server. Showing the latest daily session instead."
         )
-    if _show_daily_fallback:
-        # Fallback: show today's daily return from the price history
-        if len(prices_all) >= 2:
-            _d_prior_idx = (
-                -2 if prices_all.index[-1].date() == _today() and len(prices_all) > 1
-                else -1
+        render_latest_daily(latest_daily, VIEW_SYMS, "Latest Session Return (Daily Data)")
+    else:
+        port_live  = weighted_return(rets_min, w).rename("Portfolio")
+        bench_live = rets_min[bench].rename(bench) if bench in rets_min.columns else None
+        missing    = [s for s in VIEW_SYMS if s not in rets_min.columns]
+
+        p_now = float(port_live.iloc[-1]) if port_live.notna().any() else np.nan
+        b_now = float(bench_live.iloc[-1]) if bench_live is not None else np.nan
+        _as_of = rets_min.index.max().tz_convert(_NY)
+        render_summary_cards(p_now, b_now, note=f"as of {_as_of:%a %H:%M} ET")
+
+        view = rets_min
+        if win_opt in _mins:
+            view = rets_min.loc[rets_min.index >= rets_min.index.max() - pd.Timedelta(minutes=_mins[win_opt])]
+        chart_df = pd.concat(
+            [port_live.reindex(view.index)] + ([bench_live.reindex(view.index)] if bench_live is not None else []),
+            axis=1,
+        )
+        show_assets = st.toggle("Show individual assets", value=False, key="live_assets_toggle")
+        if show_assets:
+            chart_df = pd.concat(
+                [chart_df, view[[c for c in view.columns if c != bench]]], axis=1
             )
-            _d_prev  = prices_all.iloc[_d_prior_idx]
-            _d_today = prices_all.iloc[-1]
-            _d_rets  = (_d_today / _d_prev - 1.0).dropna()
-            _d_syms  = [s for s in VIEW_SYMS if s in _d_rets.index]
-            if _d_syms:
-                st.markdown('<div class="section-title">Today\'s Return (Daily Data)</div>', unsafe_allow_html=True)
-                _d_port_w = w.reindex([s for s in _d_syms if s != bench]).fillna(0.0)
-                if _d_port_w.sum():
-                    _d_port_w = _d_port_w / _d_port_w.sum()
-                _d_port_ret  = float((_d_rets.reindex(_d_port_w.index).fillna(0.0) * _d_port_w).sum())
-                _d_bench_ret = float(_d_rets.get(bench, np.nan)) if bench in _d_rets else np.nan
+        chart_df.index = chart_df.index.tz_convert(_NY)
 
-                _d1, _d2, _d3 = st.columns(3)
-                for _lbl, _val, _col in [
-                    ("Today (Portfolio)", _d_port_ret, _d1),
-                    (f"Today ({bench})",  _d_bench_ret, _d2),
-                    ("Today Relative",
-                     _d_port_ret - _d_bench_ret if np.isfinite(_d_bench_ret) else np.nan,
-                     _d3),
-                ]:
-                    _color = (
-                        "var(--good)" if np.isfinite(_val) and _val >= 0
-                        else "var(--bad)" if np.isfinite(_val)
-                        else "var(--muted)"
-                    )
-                    _col.markdown(
-                        f"""<div class="metric-card">
-                          <div class="metric-title">{_lbl}</div>
-                          <div class="metric-value" style="color:{_color}">
-                            {"N/A" if not np.isfinite(_val) else f"{_val:+.2%}"}
-                          </div>
-                        </div>""",
-                        unsafe_allow_html=True,
-                    )
+        fig_live = px.line(
+            chart_df,
+            labels={"value": "Return vs prior close", "variable": "Series", "index": "Time (ET)"},
+        )
+        fig_live.update_yaxes(tickformat=".2%")
+        nice_fig(fig_live, title=f"Intraday Return vs Prior Close — {len(chart_df):,} pts",
+                 xlab="Time (ET)", ylab="Return")
+        st.plotly_chart(fig_live, width="stretch")
 
-                # Bar chart of per-asset daily returns
-                _bar_df = _d_rets.reindex(_d_syms).dropna().sort_values()
-                fig_daily = px.bar(
-                    _bar_df,
-                    labels={"index": "Ticker", "value": "Return"},
-                    color=_bar_df.values,
-                    color_continuous_scale=["#ef4444", "#f59e0b", "#22c55e"],
-                    color_continuous_midpoint=0.0,
-                )
-                fig_daily.update_coloraxes(showscale=False)
-                fig_daily.update_yaxes(tickformat=".1%")
-                nice_fig(fig_daily, title=f"Daily Returns — {_d_today.name.date()}", xlab="Ticker", ylab="Return")
-                st.plotly_chart(fig_daily, use_container_width=True)
-                st.caption(f"Based on {prices_all.index[-2].date()} → {prices_all.index[-1].date()} daily close prices.")
+        _sess = pd.Series(sessions).dt.strftime("%a %b %d")
+        _groups = _sess.groupby(_sess).groups
+        st.caption(
+            "Session per asset: "
+            + " · ".join(f"{d}: {', '.join(syms)}" for d, syms in _groups.items())
+            + ". Each asset is measured from its own prior daily close; "
+              "stocks outside 09:30–16:00 ET hold their last session's return."
+        )
+        if missing:
+            st.caption(f"No intraday data for: {', '.join(missing)} (excluded; weights renormalised).")
 
 # ════════════════════════════  VOLATILITY  ═══════════════════════════════
 with tab_vol:
@@ -1021,8 +1005,8 @@ with tab_vol:
             st.info("No overlapping data for portfolio & benchmark.")
         else:
             max_win = int(min(252, len(df_rb)))
-            if max_win < 10:
-                st.info("Not enough data — choose a longer window.")
+            if max_win <= 10:
+                st.info("Not enough data for rolling statistics — choose a longer window (≥ 1M).")
             else:
                 win = st.slider(
                     "Rolling window (trading days)",
@@ -1036,9 +1020,8 @@ with tab_vol:
                     var_b      = df_rb["b"].rolling(win).var()
                     beta_roll  = (cov_pb / var_b).replace([np.inf, -np.inf], np.nan)
 
-                    last_idx       = df_rb.index[-win:]
-                    roll_vol_view  = roll_vol.loc[last_idx].dropna()
-                    beta_roll_view = beta_roll.loc[last_idx].dropna()
+                    roll_vol_view  = roll_vol.dropna()
+                    beta_roll_view = beta_roll.dropna()
 
                     c1, c2 = st.columns(2)
                     with c1:
@@ -1049,7 +1032,7 @@ with tab_vol:
                         fv.update_yaxes(tickformat=".1%")
                         nice_fig(fv, title=f"Rolling {win}D Annualised Volatility",
                                  xlab="Date", ylab="Ann. Volatility")
-                        st.plotly_chart(fv, use_container_width=True)
+                        st.plotly_chart(fv, width="stretch")
                     with c2:
                         fb = px.line(
                             beta_roll_view.rename(f"Rolling {win}D Beta"),
@@ -1057,7 +1040,7 @@ with tab_vol:
                         )
                         nice_fig(fb, title=f"Rolling {win}D Beta vs {bench}",
                                  xlab="Date", ylab="Beta")
-                        st.plotly_chart(fb, use_container_width=True)
+                        st.plotly_chart(fb, width="stretch")
                 else:
                     st.info(f"Not enough rows for a {win}-day window.")
 
@@ -1069,149 +1052,149 @@ with tab_risk:
     else:
         cols_sel = [c for c in hist_rt.columns if c in chosen and c != bench]
         R = hist_rt[cols_sel].dropna(how="all")
-        if R.empty or len(cols_sel) < 1:
+        if R.empty:
             st.info("Select at least one non-benchmark asset.")
-            st.stop()
-
-        shrink = st.slider(
-            "Covariance shrinkage λ",
-            0.0, 0.9, 0.0, 0.05,
-            help="λ=0 → sample covariance; λ>0 → shrink toward diagonal (improves stability).",
-        )
-
-        left, right = st.columns([2, 1])
-        with left:
-            if len(cols_sel) >= 2:
-                Sigma = cov_matrix(R, shrink=shrink)
-                w_now = w.reindex(cols_sel).fillna(0.0)
-                if w_now.sum():
-                    w_now = w_now / w_now.sum()
-                rc = risk_contributions(w_now, Sigma)
-                fig_rc = px.bar(
-                    rc.sort_values(ascending=False).rename("Contribution"),
-                    labels={"index": "Ticker", "value": "Risk Contribution"},
-                    color_discrete_sequence=["#f5b731"],
-                )
-                fig_rc.update_yaxes(tickformat=".0%")
-                nice_fig(fig_rc, title="Risk Contribution by Asset",
-                         xlab="Ticker", ylab="Contribution")
-                st.plotly_chart(fig_rc, use_container_width=True)
-            else:
-                st.info("Select ≥ 2 assets for risk contributions.")
-
-        with right:
-            pv, bv = ann_vol(port), ann_vol(bench_s)
-            vol_s = pd.Series({"Portfolio": pv, bench: bv}, name="Ann. Vol")
-            fig_vb = px.bar(
-                vol_s,
-                labels={"index": "Series", "value": "Ann. Volatility"},
-                color_discrete_sequence=["#4cc9f0", "#f5b731"],
+        else:
+            shrink = st.slider(
+                "Covariance shrinkage λ",
+                0.0, 0.9, 0.0, 0.05,
+                help="λ=0 → sample covariance; λ>0 → shrink toward diagonal (improves stability).",
             )
-            fig_vb.update_yaxes(tickformat=".0%")
-            nice_fig(fig_vb, title="Total Annualised Volatility",
-                     xlab="", ylab="Ann. Volatility")
-            st.plotly_chart(fig_vb, use_container_width=True)
 
-        st.divider()
-        st.subheader("Efficient Frontier & VaR")
-
-        ctl1, ctl2, ctl3, ctl4 = st.columns([1.2, 1, 1, 1.2])
-        with ctl1:
-            n_pts = st.slider("Frontier points", 10, 60, 30, 5)
-        with ctl2:
-            bmin, bmax = st.slider("Weight bounds", 0.0, 1.0, (0.0, 1.0), 0.05)
-        with ctl3:
-            var_alpha = st.select_slider(
-                "VaR confidence",
-                options=[0.90, 0.95, 0.975, 0.99],
-                value=0.95,
-            )
-        with ctl4:
-            horizon = st.slider("VaR horizon (days)", 1, 10, 1)
-
-        cA, cB = st.columns([3, 1])
-        with cA:
-            try:
+            left, right = st.columns([2, 1])
+            with left:
                 if len(cols_sel) >= 2:
-                    ef = trace_efficient_frontier(
-                        R, n_points=n_pts, bounds=(bmin, bmax), shrink=shrink
+                    Sigma = cov_matrix(R, shrink=shrink)
+                    w_now = w.reindex(cols_sel).fillna(0.0)
+                    if w_now.sum():
+                        w_now = w_now / w_now.sum()
+                    rc = risk_contributions(w_now, Sigma)
+                    fig_rc = px.bar(
+                        rc.sort_values(ascending=False).rename("Contribution"),
+                        labels={"index": "Ticker", "value": "Risk Contribution"},
+                        color_discrete_sequence=["#f5b731"],
                     )
+                    fig_rc.update_yaxes(tickformat=".0%")
+                    nice_fig(fig_rc, title="Risk Contribution by Asset",
+                             xlab="Ticker", ylab="Contribution")
+                    st.plotly_chart(fig_rc, width="stretch")
                 else:
-                    ef = pd.DataFrame()
+                    st.info("Select ≥ 2 assets for risk contributions.")
 
-                if ef.empty:
-                    st.caption("Efficient frontier requires ≥ 2 assets and scipy.")
-                else:
-                    ret_p, vol_p = ann_return(port), ann_vol(port)
-                    ew = pd.Series(1.0 / len(cols_sel), index=cols_sel)
-                    ret_ew = ann_return(R.dot(ew))
-                    vol_ew = ann_vol(R.dot(ew))
-
-                    try:
-                        w_ms = optimize_max_sharpe(R, rf_annual=rf, bounds=(bmin, bmax))
-                        w_mv = optimize_min_variance(R, bounds=(bmin, bmax))
-                    except Exception:
-                        w_ms = pd.Series(dtype=float)
-                        w_mv = pd.Series(dtype=float)
-
-                    pts = pd.DataFrame({
-                        "name":    ["Portfolio", "Equal-Weight"],
-                        "vol_ann": [vol_p, vol_ew],
-                        "ret_ann": [ret_p, ret_ew],
-                    })
-                    if not w_ms.dropna().empty:
-                        pts = pd.concat([pts, pd.DataFrame({
-                            "name":    ["Max Sharpe"],
-                            "vol_ann": [ann_vol(R.dot(w_ms))],
-                            "ret_ann": [ann_return(R.dot(w_ms))],
-                        })], ignore_index=True)
-                    if not w_mv.dropna().empty:
-                        pts = pd.concat([pts, pd.DataFrame({
-                            "name":    ["Min Variance"],
-                            "vol_ann": [ann_vol(R.dot(w_mv))],
-                            "ret_ann": [ann_return(R.dot(w_mv))],
-                        })], ignore_index=True)
-
-                    fig_ef = px.scatter(
-                        ef, x="vol_ann", y="ret_ann",
-                        labels={"vol_ann": "Volatility (Ann.)", "ret_ann": "Return (Ann.)"},
-                    )
-                    fig_ef.update_traces(mode="lines+markers")
-                    fig_ef.add_scatter(
-                        x=pts["vol_ann"], y=pts["ret_ann"],
-                        mode="markers+text", text=pts["name"],
-                        textposition="top center",
-                        marker=dict(size=10, color="#f5b731"),
-                        name="Reference Portfolios",
-                    )
-                    nice_fig(fig_ef, title="Efficient Frontier (Annualised)",
-                             xlab="Volatility", ylab="Expected Return")
-                    st.plotly_chart(fig_ef, use_container_width=True)
-            except Exception as exc:
-                st.caption(f"Frontier unavailable: {exc}")
-
-        with cB:
-            if not R.empty:
-                # Historical VaR on portfolio
-                h_var, h_cvar = hist_var_cvar(port, alpha=float(var_alpha))
-                # Monte Carlo VaR
-                mc_var, mc_es = mc_var_es(
-                    R, w.reindex(R.columns).fillna(0.0),
-                    alpha=float(var_alpha), horizon_days=int(horizon),
-                    n_sims=10_000, seed=42,
+            with right:
+                pv, bv = ann_vol(port), ann_vol(bench_s)
+                vol_s = pd.Series({"Portfolio": pv, bench: bv}, name="Ann. Vol")
+                fig_vb = px.bar(
+                    vol_s,
+                    labels={"index": "Series", "value": "Ann. Volatility"},
+                    color_discrete_sequence=["#4cc9f0", "#f5b731"],
                 )
-                st.markdown(f"""
-                <div class="metric-card">
-                  <div class="metric-title">Historical VaR ({int(var_alpha*100)}%)</div>
-                  <div class="metric-value">{h_var:.2%}</div>
-                  <div class="metric-note">CVaR: {h_cvar:.2%}</div>
-                  <div class="metric-title" style="margin-top:.5rem">MC VaR (h={int(horizon)}d)</div>
-                  <div class="metric-value">{mc_var:.2%}</div>
-                  <div class="metric-note">ES: {mc_es:.2%}</div>
-                </div>
-                """, unsafe_allow_html=True)
-            else:
-                st.info("Not enough data for VaR.")
+                fig_vb.update_yaxes(tickformat=".0%")
+                nice_fig(fig_vb, title="Total Annualised Volatility",
+                         xlab="", ylab="Ann. Volatility")
+                st.plotly_chart(fig_vb, width="stretch")
+
+            st.divider()
+            st.subheader("Efficient Frontier & VaR")
+
+            ctl1, ctl2, ctl3, ctl4 = st.columns([1.2, 1, 1, 1.2])
+            with ctl1:
+                n_pts = st.slider("Frontier points", 10, 60, 30, 5)
+            with ctl2:
+                bmin, bmax = st.slider("Weight bounds", 0.0, 1.0, (0.0, 1.0), 0.05)
+            with ctl3:
+                var_alpha = st.select_slider(
+                    "VaR confidence",
+                    options=[0.90, 0.95, 0.975, 0.99],
+                    value=0.95,
+                )
+            with ctl4:
+                horizon = st.slider("VaR horizon (days)", 1, 10, 1)
+
+            cA, cB = st.columns([3, 1])
+            with cA:
+                try:
+                    if len(cols_sel) >= 2:
+                        if bmin * len(cols_sel) > 1 or bmax * len(cols_sel) < 1:
+                            st.warning("Weight bounds are infeasible for this many assets "
+                                       "(weights must be able to sum to 100%).")
+                        ef = trace_efficient_frontier(
+                            R, n_points=n_pts, bounds=(bmin, bmax), shrink=shrink
+                        )
+                    else:
+                        ef = pd.DataFrame()
+
+                    if ef.empty:
+                        st.caption("Efficient frontier requires ≥ 2 assets and scipy.")
+                    else:
+                        # Plot reference portfolios with the same expected-return
+                        # (arithmetic mean × 252) and covariance (incl. shrinkage) the
+                        # frontier uses, so points are comparable with the curve.
+                        mu_a  = R.mean() * TRADING_DAYS
+                        S_a   = cov_matrix(R, shrink=shrink) * TRADING_DAYS
+
+                        def _pt(name: str, wv: pd.Series) -> dict:
+                            wv = wv.reindex(cols_sel).fillna(0.0)
+                            return {"name": name,
+                                    "ret_ann": float(wv @ mu_a),
+                                    "vol_ann": float(np.sqrt(wv @ S_a @ wv))}
+
+                        w_port = w.reindex(cols_sel).fillna(0.0)
+                        rows = [_pt("Portfolio", w_port / w_port.sum() if w_port.sum() else w_port),
+                                _pt("Equal-Weight", pd.Series(1.0 / len(cols_sel), index=cols_sel))]
+                        try:
+                            w_ms = optimize_max_sharpe(R, rf_annual=rf, bounds=(bmin, bmax))
+                            w_mv = optimize_min_variance(R, bounds=(bmin, bmax))
+                        except Exception:
+                            w_ms = w_mv = pd.Series(dtype=float)
+                        if w_ms.notna().all() and not w_ms.empty:
+                            rows.append(_pt("Max Sharpe", w_ms))
+                        if w_mv.notna().all() and not w_mv.empty:
+                            rows.append(_pt("Min Variance", w_mv))
+                        pts = pd.DataFrame(rows)
+
+                        fig_ef = px.scatter(
+                            ef, x="vol_ann", y="ret_ann",
+                            labels={"vol_ann": "Volatility (Ann.)", "ret_ann": "Return (Ann.)"},
+                        )
+                        fig_ef.update_traces(mode="lines+markers")
+                        fig_ef.add_scatter(
+                            x=pts["vol_ann"], y=pts["ret_ann"],
+                            mode="markers+text", text=pts["name"],
+                            textposition="top center",
+                            marker=dict(size=10, color="#f5b731"),
+                            name="Reference Portfolios",
+                        )
+                        fig_ef.update_xaxes(tickformat=".0%")
+                        fig_ef.update_yaxes(tickformat=".0%")
+                        nice_fig(fig_ef, title="Efficient Frontier (Annualised, mean returns)",
+                                 xlab="Volatility", ylab="Expected Return")
+                        st.plotly_chart(fig_ef, width="stretch")
+                except Exception as exc:
+                    st.caption(f"Frontier unavailable: {exc}")
+
+            with cB:
+                if not R.empty:
+                    # Historical VaR on portfolio
+                    h_var, h_cvar = hist_var_cvar(port, alpha=float(var_alpha))
+                    # Monte Carlo VaR
+                    mc_var, mc_es = mc_var_es(
+                        R, w.reindex(R.columns).fillna(0.0),
+                        alpha=float(var_alpha), horizon_days=int(horizon),
+                        n_sims=10_000, seed=42,
+                    )
+                    st.markdown(f"""
+                    <div class="metric-card">
+                      <div class="metric-title">Historical VaR ({int(var_alpha*100)}%)</div>
+                      <div class="metric-value">{h_var:.2%}</div>
+                      <div class="metric-note">CVaR: {h_cvar:.2%}</div>
+                      <div class="metric-title" style="margin-top:.5rem">MC VaR (h={int(horizon)}d)</div>
+                      <div class="metric-value">{mc_var:.2%}</div>
+                      <div class="metric-note">ES: {mc_es:.2%}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.info("Not enough data for VaR.")
 
 # ════════════════════════  DIVERSIFICATION  ══════════════════════════════
 with tab_div:
@@ -1280,7 +1263,7 @@ with tab_div:
                 coloraxis_colorbar=dict(title="Corr"),
             )
             fig_corr.update_xaxes(side="bottom")
-            st.plotly_chart(fig_corr, use_container_width=True)
+            st.plotly_chart(fig_corr, width="stretch")
             st.caption("🟢 Green = low correlation (good diversification) · 🔴 Red = high correlation (less diversification)")
         else:
             st.info("Add ≥ 2 non-benchmark assets to see the correlation heatmap.")
@@ -1325,7 +1308,7 @@ with tab_div:
                 paper_bgcolor="rgba(0,0,0,0)",
                 margin=dict(t=55, r=20, b=20, l=20),
             )
-            c1.plotly_chart(fig_sec, use_container_width=True)
+            c1.plotly_chart(fig_sec, width="stretch")
 
             fig_reg = px.pie(
                 values=reg_w.values, names=reg_w.index, hole=0.5,
@@ -1340,49 +1323,50 @@ with tab_div:
                 paper_bgcolor="rgba(0,0,0,0)",
                 margin=dict(t=55, r=20, b=20, l=20),
             )
-            c2.plotly_chart(fig_reg, use_container_width=True)
+            c2.plotly_chart(fig_reg, width="stretch")
 
     # ── Per-asset metrics table ────────────────────────────────────────
-    st.markdown('<div class="section-title">Per-Asset Metrics</div>', unsafe_allow_html=True)
+    if not is_today:
+        st.markdown('<div class="section-title">Per-Asset Metrics</div>', unsafe_allow_html=True)
 
-    by_asset = per_ticker_metrics(hist_rt, bench_s, rf, bench)
-    if not by_asset.empty:
-        order    = [c for c in chosen if c in by_asset.index]
-        by_asset = by_asset.reindex(order).dropna(how="all")
-        disp = by_asset.copy()
-        for c in ["AnnRet", "AnnVol", "TE", "MaxDD", "VaR95"]:
-            if c in disp.columns:
-                disp[c] = (disp[c] * 100).map("{:.2f}%".format)
-        for c in ["Sharpe", "Sortino", "Beta", "IR", "Calmar"]:
-            if c in disp.columns:
-                disp[c] = disp[c].map("{:.2f}".format)
-        st.dataframe(disp, use_container_width=True)
-    else:
-        st.info("Not enough data to compute per-asset metrics.")
+        by_asset = per_ticker_metrics(hist_rt, bench_s, rf, bench)
+        if not by_asset.empty:
+            order    = [c for c in chosen if c in by_asset.index]
+            by_asset = by_asset.reindex(order).dropna(how="all")
+            disp = by_asset.copy()
+            for c in ["AnnRet", "AnnVol", "TE", "MaxDD", "VaR95"]:
+                if c in disp.columns:
+                    disp[c] = (disp[c] * 100).map("{:.2f}%".format)
+            for c in ["Sharpe", "Sortino", "Beta", "IR", "Calmar"]:
+                if c in disp.columns:
+                    disp[c] = disp[c].map("{:.2f}".format)
+            st.dataframe(disp, width="stretch")
+        else:
+            st.info("Not enough data to compute per-asset metrics.")
 
-    # ── Downloads ─────────────────────────────────────────────────────
-    st.divider()
-    nav_df_dl = pd.DataFrame({
-        "Portfolio": nav_from_returns(port),
-        bench: nav_from_returns(bench_s) if bench_s is not None else pd.Series(dtype=float),
-    }).dropna()
-    col_dl1, col_dl2, col_dl3 = st.columns(3)
-    col_dl1.download_button(
-        "📥 Portfolio NAV (CSV)",
-        nav_df_dl.to_csv(index=True).encode("utf-8"),
-        file_name="portfolio_nav.csv", mime="text/csv",
-    )
-    if not by_asset.empty:
-        col_dl2.download_button(
-            "📥 Per-Asset Metrics (CSV)",
-            by_asset.to_csv(index=True).encode("utf-8"),
-            file_name="by_asset_metrics.csv", mime="text/csv",
+        # ── Downloads ─────────────────────────────────────────────────────
+        st.divider()
+        nav_df_dl = pd.DataFrame({
+            "Portfolio": nav_from_returns(port),
+            bench: nav_from_returns(bench_s) if bench_s is not None else pd.Series(dtype=float),
+        }).dropna()
+        col_dl1, col_dl2, col_dl3 = st.columns(3)
+        col_dl1.download_button(
+            "📥 Portfolio NAV (CSV)",
+            nav_df_dl.to_csv(index=True).encode("utf-8"),
+            file_name="portfolio_nav.csv", mime="text/csv",
         )
-    col_dl3.download_button(
-        "📥 Weights (CSV)",
-        w.rename("weight").to_csv(index=True).encode("utf-8"),
-        file_name="weights.csv", mime="text/csv",
-    )
+        if not by_asset.empty:
+            col_dl2.download_button(
+                "📥 Per-Asset Metrics (CSV)",
+                by_asset.to_csv(index=True).encode("utf-8"),
+                file_name="by_asset_metrics.csv", mime="text/csv",
+            )
+        col_dl3.download_button(
+            "📥 Weights (CSV)",
+            w.rename("weight").to_csv(index=True).encode("utf-8"),
+            file_name="weights.csv", mime="text/csv",
+        )
 
 # ══════════════════════════════════════════════════════════════════════════
 #  FOOTER

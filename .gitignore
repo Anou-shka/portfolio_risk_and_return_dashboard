@@ -13,3 +13,6 @@ data/raw/intraday/
 
 # OS
 .DS_Store
+
+# Local scratch listings
+allfiles.txt

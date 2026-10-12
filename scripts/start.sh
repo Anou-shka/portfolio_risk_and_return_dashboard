@@ -1,17 +1,10 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-# Shared data dirs
-mkdir -p data/raw/intraday data/processed
+cd "$(dirname "$0")/.."
 
-# Seed 3y history once (idempotent)
-python -m src.data_fetch init || true
-
-# Intraday daemon (background)
-python -m src.live daemon --interval 60 &
-
-# Nightly EOD updater (background)
-python -m src.auto_updater &
-
-# Streamlit UI (foreground keeps service alive)
-streamlit run app/app.py --server.port "$PORT" --server.address 0.0.0.0
+# The dashboard fetches daily and intraday prices on demand, so the UI is the
+# only process. (src.live / src.data_fetch remain available as optional CLIs.)
+exec streamlit run app/app.py \
+  --server.port "${PORT:-8501}" \
+  --server.address 0.0.0.0
