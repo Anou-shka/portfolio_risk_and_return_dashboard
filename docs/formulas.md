@@ -260,33 +260,34 @@ Given aligned daily series over a rolling window $W$:
 
 ## Intraday mechanics (live view)
 
-### Minute-by-minute return since prior close
+### Mixed calendars (stocks + crypto)
 
-Let last traded price at minute t be $L_t$, and prior official **Adj Close** be $C_{\text{prev}}$.
+Crypto trades every calendar day; US stocks trade ~252 days a year. For all historical
+analytics, prices are **aligned to stock trading days** (crypto is sampled on those days, so
+Friday→Monday is one crypto return). This keeps the 252-day annualisation valid for every asset.
 
-$$r^{(\text{intra})}_t = \frac{L_t}{C_{\text{prev}}} - 1$$
+> In code: `align_to_trading_calendar(prices)`.
 
-In code: `intraday_return_matrix(intra_close, prev_close_map)`.
+### Latest-session return per asset
 
-### Portfolio intraday return & drifted weights
+Each asset is measured against the close **before its own latest session**. A session date is the
+New York date for stocks and the UTC date for crypto (Yahoo stamps crypto daily bars at 00:00 UTC).
+With $L_t$ the latest 1-minute price and $C_{\text{prev}}$ the prior session's close:
 
-$$r^{(p,\text{intra})}_t = \sum_i w_i \cdot r^{(\text{intra})}_{i,t}$$
+$$r^{(\text{intra})}_{i,t} = \frac{L_{i,t}}{C_{i,\text{prev}}} - 1$$
 
-$$w_i^{(\text{drift})} \propto w_i \cdot \left(1 + r^{(\text{intra})}_{i,t}\right)$$
+On a Saturday, a stock shows Friday's session and BTC-USD shows Saturday's. The live matrix starts
+once every asset's latest session has begun, and each series is forward-filled.
 
-(then renormalize to sum to 1.)
+> In code: `intraday_session_returns(intra_close, daily_prices)`, `latest_daily_returns(prices)`.
 
-> In code: `live_portfolio_metrics(...)`.
+### Portfolio intraday return
 
-### Synthetic “today” row for overlay
+$$r^{(p,\text{intra})}_t = \sum_i \tilde w_i \, r^{(\text{intra})}_{i,t}, \qquad \tilde w_i = \frac{w_i}{\sum_{j \in A} w_j}$$
 
-If $P^{(\text{yday})}$ is yesterday’s adjusted close and $L$ latest price:
+where $A$ is the set of assets with intraday data (weights are renormalised over them).
 
-$$
-P^{(\text{today})} \;=\; P^{(\text{yday})} \cdot \frac{L}{C_{\text{prev}}}.
-$$
-
-> In code: `overlay_prices(prices_adj, last, prev_map)`.
+> In code: `weighted_return(returns, weights)`.
 
 ---
 
@@ -315,7 +316,7 @@ $$\tilde{W}_g = \frac{W_g}{\sum_{g'} W_{g'}}$$
 ## References in code
 
 * `metrics_core.py`: returns, NAV, annualization, Sharpe, beta/alpha, TE/IR, drawdown, covariance + shrinkage, risk contributions, optimizers, frontier, MC VaR/ES, relative series, aggregation.
-* `metrics_active.py`: intraday last/close matrix, prev close map, intraday return matrix, overlay, live portfolio metrics (drifted weights + VaR nowcast).
+* `metrics_active.py`: latest-session daily returns, intraday session returns vs prior close, weighted portfolio return.
 
 ---
 

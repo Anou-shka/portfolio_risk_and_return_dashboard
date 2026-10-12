@@ -59,7 +59,7 @@ px.defaults.template  = "plotly_dark"
 px.defaults.height    = 420
 
 # ══════════════════════════════════════════════════════════════════════════
-#  TICKER CATALOG  (80+ options shown in sidebar dropdown)
+#  TICKER CATALOG  (100+ options shown in sidebar dropdown)
 # ══════════════════════════════════════════════════════════════════════════
 TICKER_CATALOG: List[str] = [
     # ── Mega Cap Tech ──────────────────────────────────────────────────
@@ -493,7 +493,7 @@ with st.sidebar:
             options=[_CATALOG_PLACEHOLDER] + TICKER_CATALOG,
             index=0,
             key="catalog_selectbox",
-            help="80+ stocks, ETFs, and crypto to choose from.",
+            help="100+ stocks, ETFs, and crypto to choose from.",
         )
         # Manual entry
         custom_input = st.text_input(

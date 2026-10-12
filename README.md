@@ -1,69 +1,94 @@
-# Portfolio Pulse — Portfolio Risk & Return Dashboard
+# 📈 Portfolio Pulse — Portfolio Risk & Return Dashboard
 
-An interactive dashboard for portfolio analysis and risk management.
+**Build a portfolio of stocks, ETFs, and crypto, and see its return, risk, and live performance on one interactive dashboard.**
 
-It pulls **historical** (3-year daily) and **intraday** (1-minute) market data from Yahoo Finance on demand, computes core stats (Sharpe, beta, volatility, drawdowns, tracking error, information ratio), builds an **efficient frontier**, and estimates **Monte Carlo VaR / ES**. The Streamlit UI is the only process — no background daemons or persistent disk are needed, so it runs on Render's free plan.
+[**▶ Live demo**](https://portfolio-pulse.onrender.com) · Python · Streamlit · pandas · NumPy · SciPy · Plotly · yfinance · Render
 
-## What You Can Do
+> The demo runs on Render's free tier, so the first load after a quiet period can take up to a minute while the server wakes up.
 
-* **Performance at a glance:** annualized return/volatility, Sharpe, beta vs benchmark, tracking error, information ratio, max drawdown
-* **Cumulative NAV & relative perf:** "growth of $1" and portfolio − benchmark
-* **Rolling risk:** rolling vol and rolling beta with a window slider
-* **Risk decomposition:** asset-level risk contributions and total portfolio risk
-* **Efficient frontier:** visualize feasible risk/return; show equal-weight, min-variance, and max-Sharpe reference points with weight bounds
-* **VaR & ES (Monte Carlo):** choose confidence and horizon; see VaR and expected shortfall
-* **Diversification:** sector/region pies from metadata; per-asset table with key stats
-* **Live tab:** intraday portfolio vs benchmark (1-minute data). Each asset is measured against the close before its own latest session, so mixed stock + crypto portfolios work on weekends and outside US hours
+![Live intraday view](docs/assets/live_tab.png)
+<sub>Live tab: portfolio vs S&P 500, minute by minute, measured from the prior close (screenshot uses simulated prices).</sub>
 
-**Visit the live dashboard:** [Portfolio Pulse on Render](https://portfolio-pulse.onrender.com)
+---
 
-## Features
+## Why I built it
 
-* Real-time portfolio risk metrics
-* Interactive scenario testing
-* Professional financial visualizations (Plotly)
-* Sharpe Ratio, Beta, VaR/ES calculations
-* Stocks and crypto analysed on one trading calendar (crypto sampled on stock trading days) so 252-day annualisation is valid
+Brokerage apps show you prices. They rarely answer the questions a portfolio manager asks: *How much risk am I taking for this return? Which holding drives most of my volatility? Is there a better mix of the same assets? How bad could tomorrow be?*
 
-## Local Development
+Portfolio Pulse answers those questions for any portfolio you build, using standard quantitative finance methods. Every formula is documented in [`docs/formulas.md`](docs/formulas.md).
 
-```bash
-# 1) Clone and install
-git clone https://github.com/Anou-shka/portfolio_risk_and_return_dashboard.git
-cd portfolio_risk_and_return_dashboard
-python -m venv .venv && source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+## What it does
 
-# 2) Run the UI (same command Render uses)
-bash scripts/start.sh            # or: streamlit run app/app.py
+| Tab | What you get |
+|---|---|
+| **📈 Performance** | Annualised return and volatility; Sharpe, Sortino, Treynor and Calmar ratios; beta, tracking error and information ratio vs a benchmark; max drawdown; historical VaR / CVaR; growth-of-$1 chart and cumulative outperformance |
+| **⚡ Live** | 1-minute portfolio vs benchmark return since the prior close. Refreshes every minute and works on weekends and overnight for mixed stock + crypto portfolios |
+| **📉 Volatility** | Rolling annualised volatility and rolling beta with an adjustable window |
+| **⚠️ Risk & Frontier** | Each asset's contribution to portfolio risk; efficient frontier with max-Sharpe, min-variance, equal-weight and your portfolio marked; Monte Carlo VaR & Expected Shortfall with adjustable confidence and horizon; covariance shrinkage |
+| **🔀 Diversification** | Diversification ratio, correlation heatmap, sector and region allocation, per-asset metrics table, CSV downloads |
+
+**Build any portfolio:** pick from 100+ stocks, ETFs and cryptocurrencies or type any Yahoo Finance ticker. Weight it equally, set custom weights, or let the optimiser choose **max-Sharpe** or **min-variance** weights. Analyse any window from the latest session up to 3 years, against any benchmark, with a live 10-year Treasury rate as the risk-free rate.
+
+## Engineering highlights
+
+- **Correct maths across mixed markets.** Crypto trades 365 days a year and stocks about 252. Naively mixing them turns every weekend into a fake 0% stock return and breaks annualisation. Prices are aligned to one trading calendar, so every metric uses a consistent 252-day basis.
+- **Per-asset session logic for "today".** On a Saturday a stock's latest session is Friday while Bitcoin's is Saturday. In the evening, Yahoo's crypto bars have already rolled to the next UTC day. Each asset is measured from its own prior close, so the daily and live numbers always agree.
+- **Portfolio optimisation.** Constrained mean-variance optimisation with SciPy's SLSQP solver: max-Sharpe, min-variance, and an efficient frontier traced from the min-variance point, with user-set weight bounds.
+- **Risk modelling.** Historical and Monte Carlo (multivariate normal) VaR / Expected Shortfall, Euler risk contributions, and optional shrinkage of the covariance matrix toward its diagonal for stability.
+- **Lean, reliable deployment.** A single Streamlit process fetches data on demand with caching (5 minutes for daily data, under a minute for intraday) and retries. It fits Render's free 512 MB instance with no background workers or persistent disk. The Live tab refreshes in place without re-running the whole dashboard.
+- **Tested against edge cases.** End-to-end runs with simulated market data across market hours, pre-open, evenings, weekends, every time window and every weighting mode.
+
+## Project structure
+
+```
+app/app.py              Streamlit UI: sidebar, tabs, charts, data fetching with caching
+src/metrics_core.py     Returns, risk ratios, drawdown, beta/alpha, optimisers, frontier, VaR/ES
+src/metrics_active.py   Latest-session and intraday returns across stock and crypto calendars
+src/config.py           Benchmark, risk-free rate and refresh settings from config/portfolio.yaml
+src/data_fetch.py       Optional CLI: snapshot 3-year history to Parquet
+src/live.py             Optional CLI: 1-minute intraday cache to Parquet
+docs/formulas.md        Every formula used, with notation and code references
+render.yaml             One-click Render deployment (Blueprint)
 ```
 
-> Never commit `.venv/` — Render builds its own virtualenv at that exact path, so a committed one breaks deploys.
+## Run it locally
 
-### Optional offline data tools
+```bash
+git clone https://github.com/Anou-shka/portfolio_risk_and_return_dashboard.git
+cd portfolio_risk_and_return_dashboard
+python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+bash scripts/start.sh                                 # or: streamlit run app/app.py
+```
 
-The app does not need these; they snapshot data to Parquet for offline analysis.
+Then open http://localhost:8501.
+
+<details>
+<summary><b>Optional offline data tools</b></summary>
+
+The app doesn't need these; they save data to Parquet for offline analysis.
 
 ```bash
 python -m src.data_fetch init     # 3y daily history → data/processed/
 python -m src.data_fetch update   # append the official daily bar after the close (--force off-hours)
 python -m src.live daemon         # 1-minute cache → data/raw/intraday/ (US market hours)
 ```
+</details>
 
-## Deploying on Render
+## Deploy on Render
 
-`render.yaml` is a ready Blueprint (free plan, Python 3.12, start command `bash scripts/start.sh`).
-If the service was created manually, set **Start Command** to `bash scripts/start.sh` and
-**Build Command** to `pip install -r requirements.txt` in the service settings.
+`render.yaml` is a ready Blueprint (free plan, Python 3.12). For a manually created service, set:
 
-### Environment Variables
+- **Build Command:** `pip install -r requirements.txt`
+- **Start Command:** `bash scripts/start.sh`
 
-* `PYTHONUNBUFFERED=1`
-* `STREAMLIT_SERVER_HEADLESS=true`
-* `APP_ACCESS_CODE=<optional password>` (enables a simple access gate in the UI)
-* `PP_VALIDATE_METRICS=1` (optional: log a SPY-vs-QQQ metrics self-check once per session)
+| Environment variable | Purpose |
+|---|---|
+| `APP_ACCESS_CODE` | Optional password gate: visitors need the link **and** the code |
+| `PP_VALIDATE_METRICS=1` | Optional: log a SPY-vs-QQQ metrics self-check once per session |
 
+## Notes & limitations
 
-## Access Control (Optional)
-
-Set `APP_ACCESS_CODE` in Render. On load, the app shows a small password prompt; only users with the link **and** the code can view.
+- Market data comes from Yahoo Finance via `yfinance`. Yahoo sometimes rate-limits cloud servers; the app retries, then shows a clear message instead of failing.
+- Monte Carlo VaR assumes normally distributed returns, which understates fat tails. Historical VaR is shown alongside it for comparison.
+- For analysis and education only; not investment advice.
